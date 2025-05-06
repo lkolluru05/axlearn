@@ -1369,8 +1369,6 @@ class OptimizerTest(TestCase):
         ),
         weight_decay=(1e-4,),
     )
-
-    # pylint: disable=R0917
     def test_adastar_vs_adamw_decoupled(
         self, learning_rate, b1, b2, eps, update_schedule, weight_decay
     ):
@@ -1428,7 +1426,6 @@ class OptimizerTest(TestCase):
         clipping_threshold=(None, 1e-2, 1.0),
         weight_decay=(1e-4,),
     )
-    # pylint: disable=R0917
     def test_adastar_vs_adafactor(
         self,
         learning_rate,
@@ -1540,7 +1537,6 @@ class OptimizerTest(TestCase):
             weight_decay_per_param_scale=0.3,
         ),
     )
-    # pylint: disable=R0917
     def test_adastar_summaries(
         self,
         learning_rate,

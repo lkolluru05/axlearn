@@ -20,20 +20,25 @@ import asyncio
 import functools
 import math
 import os
+import math
+import os
 import threading
 import time
 from collections import defaultdict
 from concurrent import futures
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
 
 import jax
 import jax.numpy as jnp
+import jax.numpy as jnp
 import numpy as np
 import tensorstore as ts
+import tensorstore as ts
 from absl import logging
-from jax._src import array, typing
+from jax._src import array, config, typing
 from jax._src.layout import Layout
 from jax.experimental.array_serialization import serialization
 
@@ -450,9 +455,7 @@ async def _async_deserialize(
         mb_256 = 256 * 1024 * 1024
         out_size = math.ceil(out_size / mb_256) * mb_256
 
-        layout = Layout(
-            dll, jax.sharding.SingleDeviceSharding(device, memory_kind=in_sharding.memory_kind)
-        )
+        layout = Layout(dll, jax.sharding.SingleDeviceSharding(device))
         try:
             await h2d_limiter.wait_for_bytes(out_size)
             result = await loop.run_in_executor(None, _blocking_device_put, out, layout)
@@ -522,6 +525,14 @@ def _get_premapped_buffer_size():
     return 1099511627776
 
 
+def _get_premapped_buffer_size():
+    if jax.default_backend() == "tpu":
+        # If TPU_PREMAPPED_BUFFER_SIZE is not set, default is 4GB.
+        return int(os.getenv("TPU_PREMAPPED_BUFFER_SIZE", "4294967296"))
+    # On all other backends, use 1TB (effectively unlimited).
+    return 1099511627776
+
+
 class GlobalAsyncCheckpointManager(serialization.GlobalAsyncCheckpointManager):
     """Similar to GlobalAsyncCheckpointManager but allows passing additional futures to be awaited
     while asynchronously serializing tensors.
@@ -533,11 +544,18 @@ class GlobalAsyncCheckpointManager(serialization.GlobalAsyncCheckpointManager):
         self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
         self._loop_thread.start()
         self._single_thread_pool = ThreadPoolExecutor(1)
+        self._single_thread_pool = ThreadPoolExecutor(1)
 
+    def stop(self):
+        """Cleans up any internal threads."""
     def stop(self):
         """Cleans up any internal threads."""
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop_thread.join()
+        self._single_thread_pool.shutdown()
+
+    def __del__(self):
+        self.stop()
         self._single_thread_pool.shutdown()
 
     def __del__(self):
@@ -580,9 +598,9 @@ class GlobalAsyncCheckpointManager(serialization.GlobalAsyncCheckpointManager):
 
     # Copied from (with modifications)
     # https://github.com/jax-ml/jax/blob/66037d10e7742c4fcadd07f0459a00813ec7ed5f/jax/experimental/array_serialization/serialization.py#L413-L429
-    # pylint: disable=too-many-arguments
     def deserialize(
         self,
+        shardings: Sequence[Union[jax.sharding.Sharding, Layout]],
         shardings: Sequence[Union[jax.sharding.Sharding, Layout]],
         tensorstore_specs: Sequence[dict[str, Any]],
         global_shapes: Optional[Sequence[array.Shape]] = None,
@@ -596,11 +614,18 @@ class GlobalAsyncCheckpointManager(serialization.GlobalAsyncCheckpointManager):
         async def _run_deserializer():
             # Object should be created once per process.
             # pylint: disable=protected-access
+            # pylint: disable=protected-access
             byte_limiter = serialization._LimitInFlightBytes(concurrent_bytes)
+            h2d_limiter = serialization._LimitInFlightBytes(_get_premapped_buffer_size())
             h2d_limiter = serialization._LimitInFlightBytes(_get_premapped_buffer_size())
 
             future_arrays = jax.tree.map(
-                functools.partial(serialization.async_deserialize, byte_limiter=byte_limiter),
+                functools.partial(
+                    _async_deserialize,
+                    byte_limiter=byte_limiter,
+                    h2d_limiter=h2d_limiter,
+                    single_thread_pool=self._single_thread_pool,
+                ),
                 shardings,
                 tensorstore_specs,
                 [None] * len(tensorstore_specs) if global_shapes is None else global_shapes,
@@ -616,12 +641,15 @@ class BoundedDataShardedAsyncCheckpointManager(GlobalAsyncCheckpointManager):
     """Similar to GlobalAsyncCheckpointManager but with few improvements:
 
     1. Tensorstore calls now run in a background event loop, hiding the cost of `ts.open` and
+    1. Tensorstore calls now run in a background event loop, hiding the cost of `ts.open` and
     `ts.copy`. Now, only D2H blocks training while serialization is fully asynchronous.
+    2. Added additional sharding along data-parallel axis during save to further reduce host memory
     2. Added additional sharding along data-parallel axis during save to further reduce host memory
     overhead and improves D2H time. It's achieved by sharding the first dim that's divisible by the
     data-parallel dim. We manipulate shard.index to match the sliced shard, so to tensorstore it
     behaves as if we're sharding along the data-parallel axis. If no such dim is found, we use the
     old way to save-restore, i.e. using the first (0th) replica to do the save only.
+    3. Optionally one can specify max_concurrent_gb to limit in-flight host memory during
     3. Optionally one can specify max_concurrent_gb to limit in-flight host memory during
     device-to-host transfers and tensorstore writes.
 
