@@ -293,6 +293,7 @@ class IndexFileWriter(Protocol):
 
 def write_index_file(*, ckpt_dir: str, index: Any):
     """An on_commit_callback that writes an index file to ckpt_dir."""
+    fs.makedirs(ckpt_dir)
     index_path = os.path.join(ckpt_dir, "index")
     logging.info("Writing index file to %s", index_path)
     with fs.open(index_path, "w") as f:

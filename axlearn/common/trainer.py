@@ -58,6 +58,7 @@ from axlearn.common.utils import (
     canonicalize_per_param_dtype,
     count_model_params,
     flatten_items,
+    host_to_global_specs,
     match_regex_rules,
     thread_stack_traces,
 )
@@ -368,6 +369,8 @@ class SpmdTrainer(Module):
         return self._trainer_state_partition_specs
 
     def _train_step_input_partition_specs(self):
+        # Note that subclasses may override this method to set a partition spec for pjit which is
+        # different from that of the input partition spec.
         return self.input.partition_spec
 
     def model_params_for_eval(self):
@@ -610,7 +613,7 @@ class SpmdTrainer(Module):
                         )
                         self.vlog(3, "Done step %s", self.step)
                         num_steps += 1
-                        if num_steps % 100 == 0:
+                        if num_steps % 1 == 0:
                             now = time.perf_counter()
                             average_step_time = (now - start_time) / num_steps
                             self._step_log("Average step time: %s seconds", average_step_time)
@@ -1086,6 +1089,7 @@ class SpmdTrainer(Module):
             A dict containing 'loss' and 'aux' outputs. If force_run_evals is a set,
             force run the evalers in the set and return 'evaler_summaries' output.
         """
+        start_time = time.perf_counter()
         with jax.profiler.StepTraceAnnotation("train", step_num=self.step):
             run_with_xsc = self._xsc_check_policy and self._xsc_check_policy(self.step)
             compiled_train_step_fn = self._get_compiled_train_step_fn(
@@ -1100,6 +1104,9 @@ class SpmdTrainer(Module):
                 outputs["loss"],
                 jax.tree.map(lambda x: x.item() if x.ndim == 0 else f"T{x.shape}", outputs["aux"]),
             )
+        now = time.perf_counter()
+        average_step_time = (now - start_time)
+        self._step_log("Average step time in _run_step: %s seconds", average_step_time)
 
         self.summary_writer(self.step, {"loss": outputs["loss"], **outputs["summaries"]})
         # Aggregate summaries across evalers.
@@ -1191,9 +1198,14 @@ class SpmdTrainer(Module):
                     self.trainer_state_specs,
                 )
             if input_batch is None:
-                # Infer input batch shapes from input element spec.
-                # N.B. in a multi-process setting these will be host-local (per process).
-                input_batch = self.input.element_spec()
+                # Infer global input batch shapes from input element spec.
+                host_batch = self.input.element_spec()
+                if "input_dispatcher" in self.input.children:
+                    host_batch = self.input.input_dispatcher.logical_to_physical_shapes(host_batch)
+                input_batch = host_to_global_specs(
+                    host_batch, partition=self._train_step_input_partition_specs()
+                )
+
             # Rely on the instance handle to ensure that we hit the compilation cache if possible.
             jit_train_step = self._jit_train_step or self._pjit_train_step()
             # Note(Jan 2022):
