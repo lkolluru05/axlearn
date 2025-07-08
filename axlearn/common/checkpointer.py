@@ -147,60 +147,51 @@ def check_state_structure(
         )
 
 
-# def _upload_dir(src_dir_handle: tempfile.TemporaryDirectory, *, dst_dir: str):
-#     """Upload a directory (non-recursively) from a temporary dir to dst_dir.
+def _upload_dir(src_dir_handle: tempfile.TemporaryDirectory, *, dst_dir: str):
+    """Upload a directory (non-recursively) from a temporary dir to dst_dir.
 
-#     Temporary dir will be deleted after the upload is complete.
-#     """
-#     src_dir = src_dir_handle.name
-#     src_files = fs.listdir(src_dir)
-#     # src_files will be empty if there are no tf savables (i.e., don't have any tf state to save).
-#     # In this case, do not create empty dst_dirs.
-#     if len(src_files):
-#         fs.makedirs(dst_dir)
-#     for item in src_files:
-#         src_file = os.path.join(src_dir, item)
-#         dst_file = os.path.join(dst_dir, item)
-#         assert not fs.isdir(src_file)
-#         fs.copy(src_file, dst_file, overwrite=True)
-#     src_dir_handle.cleanup()
+    Temporary dir will be deleted after the upload is complete.
+    """
+    src_dir = src_dir_handle.name
+    src_files = fs.listdir(src_dir)
+    # src_files will be empty if there are no tf savables (i.e., don't have any tf state to save).
+    # In this case, do not create empty dst_dirs.
+    if len(src_files):
+        fs.makedirs(dst_dir)
+    for item in src_files:
+        src_file = os.path.join(src_dir, item)
+        dst_file = os.path.join(dst_dir, item)
+        assert not fs.isdir(src_file)
+        fs.copy(src_file, dst_file, overwrite=True)
+    src_dir_handle.cleanup()
 
 
 # pylint: disable=redefined-builtin
-def async_save_tf_savables(value_map: Nested[Any], *, dir: str) -> list[tf.train.Checkpoint]:
+def async_save_tf_savables(
+    value_map: Nested[Any], *, executor: futures.ThreadPoolExecutor, dir: str
+) -> futures.Future:
     """Asynchronously saves TF savables from `value_map` into `dir`.
 
     When this call returns, `value_map` can be safely mutated, but saving to `dir` will not
     complete unless the returned future is set.
     """
-    tf_ckpts = []
+    # pylint: disable-next=consider-using-with
+    f = tempfile.TemporaryDirectory()
     for path, value in utils.flatten_items(value_map):
         tf_checkpoint = tf.train.Checkpoint(value)
-        tf_checkpoint.write(os.path.join(dir, path), tf.train.CheckpointOptions(enable_async=True))
-        tf_ckpts.append(tf_checkpoint)
-    return tf_ckpts
+        tf_checkpoint.write(os.path.join(f.name, path))
+    return executor.submit(_upload_dir, f, dst_dir=dir)
 
-
-# # pylint: disable-next=redefined-builtin
-# def restore_tf_savables(value_map: Nested[Any], *, dir: str) -> Nested[Any]:
-#     """Restores TF savables from `dir` into `value_map` in-place."""
-
-#     for path, value in utils.flatten_items(value_map):
-#         tf_checkpoint = tf.train.Checkpoint(value)
-#         tf_checkpoint.read(os.path.join(dir, path))
-
-#     return value_map
 
 # pylint: disable-next=redefined-builtin
-def async_restore_tf_savables(value_map: Nested[Any], *, dir: str) -> list[tf.train.Checkpoint]:
+def restore_tf_savables(value_map: Nested[Any], *, dir: str) -> Nested[Any]:
     """Restores TF savables from `dir` into `value_map` in-place."""
-    ckpts = []
+
     for path, value in utils.flatten_items(value_map):
         tf_checkpoint = tf.train.Checkpoint(value)
-        tf_checkpoint.read(os.path.join(dir, path), tf.train.CheckpointOptions(enable_async=True))
-        ckpts.append(tf_checkpoint)
+        tf_checkpoint.read(os.path.join(dir, path))
 
-    return ckpts
+    return value_map
 
 
 @runtime_checkable
@@ -302,6 +293,7 @@ class IndexFileWriter(Protocol):
 
 def write_index_file(*, ckpt_dir: str, index: Any):
     """An on_commit_callback that writes an index file to ckpt_dir."""
+    fs.makedirs(ckpt_dir)
     index_path = os.path.join(ckpt_dir, "index")
     logging.info("Writing index file to %s", index_path)
     with fs.open(index_path, "w") as f:
@@ -526,18 +518,11 @@ class TensorStoreStateStorage(StateStorage):
         # Wait for directory and index creation.
         multihost_utils.sync_global_devices(ckpt_dir)
         # Each worker writes its tf checkpoints under a different path.
-
-        # save_tf_future = async_save_tf_savables(
-        #     spec.tf_ckpt_map,
-        #     executor=self._executor,
-        #     dir=os.path.join(ckpt_dir, f"tf_{jax.process_index()}"),
-        # )
-
-        tf_ckpts = async_save_tf_savables(
+        save_tf_future = async_save_tf_savables(
             spec.tf_ckpt_map,
+            executor=self._executor,
             dir=os.path.join(ckpt_dir, f"tf_{jax.process_index()}"),
         )
-
         maybe_save_python_savables(
             spec.python_ckpt_map, dir=os.path.join(ckpt_dir, f"python_{jax.process_index()}")
         )
@@ -545,9 +530,8 @@ class TensorStoreStateStorage(StateStorage):
         def commit():
             on_commit_callback(ckpt_dir=ckpt_dir, index=spec.index)
             logging.info(
-                "Checkpointer[%s] saving total time at step %s: %s seconds.",
-                os.path.basename(os.path.dirname(ckpt_dir)),
-                step,
+                "Serialization of %s completed in %s seconds.",
+                ckpt_dir,
                 time.perf_counter() - start_time,
             )
 
@@ -559,7 +543,7 @@ class TensorStoreStateStorage(StateStorage):
             spec.gda_values,
             spec.tensorstore_specs,
             on_commit_callback=commit,
-            additional_futures=[self._executor.submit(ckpt.sync) for ckpt in tf_ckpts],
+            additional_futures=[save_tf_future],
         )
 
     def wait_until_finished(self):
@@ -578,23 +562,13 @@ class TensorStoreStateStorage(StateStorage):
         check_state_structure(
             read_index_file(ckpt_dir), target_structure=spec.index, validation=validation
         )
-        # restore_tf_savables(
-        #     spec.tf_ckpt_map, dir=os.path.join(ckpt_dir, f"tf_{jax.process_index()}")
-        # )
-        tf_ckpts = async_restore_tf_savables(
+        restore_tf_savables(
             spec.tf_ckpt_map, dir=os.path.join(ckpt_dir, f"tf_{jax.process_index()}")
         )
         maybe_restore_python_savables(
             spec.python_ckpt_map, dir=os.path.join(ckpt_dir, f"python_{jax.process_index()}")
         )
-        #return self._restore_tensorstore_state(state, ckpt_dir=ckpt_dir, spec=spec)
-
-        restored_state = self._restore_tensorstore_state(state, ckpt_dir=ckpt_dir, spec=spec)
-
-        for tf_ckpt in tf_ckpts:
-            tf_ckpt.sync()
-
-        return restored_state
+        return self._restore_tensorstore_state(state, ckpt_dir=ckpt_dir, spec=spec)
 
     def _restore_tensorstore_state(
         self, state, *, ckpt_dir: str, spec: CheckpointSpec, sync: bool = True
@@ -849,8 +823,7 @@ class BaseCheckpointer(Module):
         This is typically invoked prior to the training loop.
         """
         if self._within_context:
-            logging.warn("Already in a context.")
-            #raise ValueError("Already in a context.")
+            raise ValueError("Already in a context.")
         self._within_context = True
 
     def __exit__(
@@ -1070,7 +1043,6 @@ class Checkpointer(BaseCheckpointer):
         In addition to behavior in `BaseCheckpointer`, saving only happens if the configured
         checkpoint policy returns True for the given step and evaler summaries.
         """
-        start_time = time.perf_counter()
         if not self._save_policy(step=step, evaler_summaries=(evaler_summaries or {})):
             return
         if step < 0 or step >= 10**8:
@@ -1085,14 +1057,6 @@ class Checkpointer(BaseCheckpointer):
                 state=state,
                 ckpt_dir=ckpt_dir,
                 action=CheckpointerAction.SAVE,
-            )
-        
-        if jax.process_index() == 0:
-            logging.info(
-                "Checkpointer[%s] saving stall time at step %s: %s seconds.",
-                os.path.basename(os.path.dirname(ckpt_dir)),
-                step,
-                time.perf_counter() - start_time,
             )
 
     def _run_garbage_collection(self):
@@ -1137,8 +1101,7 @@ class Checkpointer(BaseCheckpointer):
 
         # For subsequent dirs, non-committed dirs are gc'ed, and committed dirs are kept according
         # to keep_n_steps. Note that we iterate in order of oldest to newest.
-        #last_kept_step = float("-inf")
-        last_kept_step = 0
+        last_kept_step = float("-inf")
         for saved_dir in reversed(dirs[len(remaining_dirs) + len(gc_dirs) :]):
             saved_step = parse_step_from_dir(saved_dir)
             if not (

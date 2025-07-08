@@ -31,14 +31,11 @@ from axlearn.common.checkpointer import (
     check_state_structure,
     maybe_restore_python_savables,
     maybe_save_python_savables,
-    #restore_tf_savables,
-    async_restore_tf_savables,
+    restore_tf_savables,
 )
 from axlearn.common.config import config_class
 from axlearn.common.module import Module
 from axlearn.common.utils import Nested, Tensor, TensorSpec
-from orbax.checkpoint._src.metadata import array_metadata_store as array_metadata_store_lib
-from orbax.checkpoint._src.serialization.type_handlers import ArrayHandler
 
 try:
     # The import also registers the checkpoint handlers.
@@ -61,10 +58,6 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
     instances), we construct and cleanup the executor per-serialize/deserialize call.
     """
 
-    def __init__(self):
-        super().__init__()
-        self._executor = futures.ThreadPoolExecutor()
-
     # Must be a subclass of RestoreArgs for `PyTreeRestore` to recognize it.
     @dataclasses.dataclass
     class RestoreArgs(ocp.type_handlers.RestoreArgs):
@@ -75,8 +68,7 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
 
     def _ckpt_dir(self, info: ocp.type_handlers.ParamInfo) -> str:
         # Each worker writes its tf checkpoints under a different path.
-        #return os.path.join(info.parent_dir, f"tf_{jax.process_index()}")
-        return os.path.join(os.path.dirname(info.parent_dir), "tfds", f"tf_{jax.process_index()}")
+        return os.path.join(info.parent_dir, f"tf_{jax.process_index()}")
 
     async def serialize(
         self,
@@ -87,18 +79,14 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
         """Serializes `values` into corresponding `info.path`s."""
         del args  # Unused.
         futs = []
-        # with futures.ThreadPoolExecutor(max_workers=1) as executor:
-        #     for value, info in zip(values, infos):
-        #         futs.append(
-        #             async_save_tf_savables(
-        #                 {info.name: value}, executor=executor, dir=self._ckpt_dir(info)
-        #             )
-        #         )
-        for value, info in zip(values, infos):
-            for tf_ckpt in async_save_tf_savables({info.name: value}, dir=self._ckpt_dir(info)):
-                futs.append(self._executor.submit(tf_ckpt.sync))
+        with futures.ThreadPoolExecutor(max_workers=1) as executor:
+            for value, info in zip(values, infos):
+                futs.append(
+                    async_save_tf_savables(
+                        {info.name: value}, executor=executor, dir=self._ckpt_dir(info)
+                    )
+                )
         return futs
-
 
     async def deserialize(
         self,
@@ -107,32 +95,17 @@ class _TfIteratorHandler(ocp.type_handlers.TypeHandler):
     ) -> Sequence[tf.data.Iterator]:
         if args is None:
             raise ValueError(f"{self.RestoreArgs.__name__} should be supplied as args.")
-        # futs = []
-        # with futures.ThreadPoolExecutor(max_workers=1) as executor:
-        #     for arg, info in zip(args, infos):
+        futs = []
+        with futures.ThreadPoolExecutor(max_workers=1) as executor:
+            for arg, info in zip(args, infos):
 
-        #         def restore(arg=arg, info=info):
-        #             return restore_tf_savables({info.name: arg.item}, dir=self._ckpt_dir(info))[
-        #                 info.name
-        #             ]
+                def restore(arg=arg, info=info):
+                    return restore_tf_savables({info.name: arg.item}, dir=self._ckpt_dir(info))[
+                        info.name
+                    ]
 
-        #         futs.append(asyncio.get_event_loop().run_in_executor(executor, restore))
-        # return await asyncio.gather(*futs)
-        iter_ckpts = [
-            ckpt
-            for arg, info in zip(args, infos)
-            for ckpt in async_restore_tf_savables({info.name: arg.item}, dir=self._ckpt_dir(info))
-        ]
-
-        await asyncio.gather(
-            *(
-                asyncio.get_event_loop().run_in_executor(self._executor, ckpt.sync)
-                for ckpt in iter_ckpts
-            )
-        )
-
-        return [arg.item for arg in args]
-
+                futs.append(asyncio.get_event_loop().run_in_executor(executor, restore))
+        return await asyncio.gather(*futs)
 
     async def metadata(
         self, infos: Sequence[ocp.type_handlers.ParamInfo]
@@ -147,12 +120,6 @@ if _GRAIN_INSTALLED:
     # TODO(markblee): Generalize to PythonSavableHandler.
     class _GrainDatasetIteratorHandler(ocp.type_handlers.TypeHandler):
         """Serializes grain dataset iterators."""
-        def __init__(self):
-            super().__init__()
-            self._executor = futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="GrainDatasetIteratorHandler"
-            )
-
 
         @dataclasses.dataclass
         class RestoreArgs(ocp.type_handlers.RestoreArgs):
@@ -163,10 +130,7 @@ if _GRAIN_INSTALLED:
 
         def _ckpt_dir(self, info: ocp.type_handlers.ParamInfo) -> str:
             # Each worker writes its grain checkpoints under a different path.
-            # return os.path.join(info.parent_dir, f"python_{jax.process_index()}")
-            return os.path.join(
-                os.path.dirname(info.parent_dir), "python", f"python_{jax.process_index()}"
-            )
+            return os.path.join(info.parent_dir, f"python_{jax.process_index()}")
 
         async def serialize(
             self,
@@ -176,18 +140,9 @@ if _GRAIN_INSTALLED:
         ) -> List[futures.Future]:
             """Serializes `values` into corresponding `info.path`s."""
             del args  # Unused.
-            # for value, info in zip(values, infos):
-            #     maybe_save_python_savables({info.name: value}, dir=self._ckpt_dir(info))
-            # return []
-            futs = []
             for value, info in zip(values, infos):
-                futs.append(
-                    self._executor.submit(
-                        maybe_save_python_savables, {info.name: value}, dir=self._ckpt_dir(info)
-                    )
-                )
-
-            return futs
+                maybe_save_python_savables({info.name: value}, dir=self._ckpt_dir(info))
+            return []
 
         async def deserialize(
             self,
@@ -196,29 +151,14 @@ if _GRAIN_INSTALLED:
         ) -> Sequence[_GrainIterator]:
             if args is None:
                 raise ValueError(f"{self.RestoreArgs.__name__} should be supplied as args.")
-            # ret = []
-            # for arg, info in zip(args, infos):
-            #     ret.append(
-            #         maybe_restore_python_savables({info.name: arg.item}, dir=self._ckpt_dir(info))[
-            #             info.name
-            #         ]
-            #     )
-            # return ret
-            await asyncio.gather(
-                *(
-                    asyncio.get_event_loop().run_in_executor(
-                        self._executor,
-                        functools.partial(
-                            maybe_restore_python_savables,
-                            {info.name: arg.item},
-                            dir=self._ckpt_dir(info),
-                        ),
-                    )
-                    for arg, info in zip(args, infos)
+            ret = []
+            for arg, info in zip(args, infos):
+                ret.append(
+                    maybe_restore_python_savables({info.name: arg.item}, dir=self._ckpt_dir(info))[
+                        info.name
+                    ]
                 )
-            )
-
-            return [arg.item for arg in args]
+            return ret
 
         async def metadata(
             self, infos: Sequence[ocp.type_handlers.ParamInfo]
@@ -253,16 +193,17 @@ class OrbaxCheckpointer(BaseCheckpointer):
             keep_every_n_steps: If set, keep a checkpoint every n steps.
             validation_type: Checkpoint validation during restore.
             async_timeout_secs: Timeout for async barrier in seconds.
+            use_replica_parallel: Whether to use replica parallel checkpointing.
         """
 
         keep_last_n: int = 1
-        keep_period: Optional[int] = None
         keep_every_n_steps: Optional[int] = None
         validation_type: CheckpointValidationType = CheckpointValidationType.EXACT
         async_timeout_secs: int = 300
         max_concurrent_save_gb: Optional[int] = None
         max_concurrent_restore_gb: Optional[int] = None
         enable_single_replica_ckpt_restoring: bool = True
+        use_replica_parallel: bool = False
 
     @classmethod
     def checkpoint_paths(cls, base_dir: str) -> List[str]:
@@ -277,6 +218,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
 
+        logging.set_verbosity(logging.DEBUG)
         cfg: OrbaxCheckpointer.Config = self.config
         save_policy = cfg.save_policy.instantiate()
 
@@ -304,7 +246,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
             options=ocp.CheckpointManagerOptions(
                 create=True,
                 max_to_keep=cfg.keep_last_n,
-                keep_period=cfg.keep_period,
+                keep_period=cfg.keep_every_n_steps,
                 enable_async_checkpointing=True,
                 step_name_format=self._name_format,
                 should_save_fn=save_fn_with_summaries,
@@ -353,9 +295,22 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         Checkpoint saving is handled by `orbax` checkpoint manager.
         """
+        cfg: OrbaxCheckpointer.Config = self.config
         spec = self._get_spec(step=step, state=state)
         assert self._eval_summaries is None, self._eval_summaries
         self._eval_summaries = copy.deepcopy(evaler_summaries or {})
+
+        # Store the original handler to restore it later
+        original_handler = None
+        if not cfg.use_replica_parallel:
+            # Get the current handler for jax.Array
+            original_handler = ocp.type_handlers.get_type_handler(jax.Array)
+            # Register a new ArrayHandler with use_replica_parallel=False
+            custom_handler = ArrayHandler(
+                use_replica_parallel=False,
+                array_metadata_store=array_metadata_store_lib.Store(),
+            )
+            ocp.type_handlers.register_type_handler(jax.Array, custom_handler, override=True)
 
         try:
             # Note that save() waits for prior serialization to finish.
@@ -369,6 +324,7 @@ class OrbaxCheckpointer(BaseCheckpointer):
                     # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#custom-chunk-sizes
                     # https://orbax.readthedocs.io/en/latest/optimized_checkpointing.html#customizing-data-file-size
                     state=ocp.args.PyTreeSave(item=state),
+                    #state=ocp.args.PyTreeSave(item=state,ocdbt_target_data_file_size=500*1024*1024),
                 ),
             )
             # Exit early after pre-emption, equivalent to sys.exit():
@@ -377,6 +333,9 @@ class OrbaxCheckpointer(BaseCheckpointer):
                 self._manager.wait_until_finished()
                 raise SystemExit(f"Exiting after saving checkpoint at {step=} due to pre-emption.")
         finally:
+            # Restore the original handler if we modified it
+            if not cfg.use_replica_parallel and original_handler is not None:
+                ocp.type_handlers.register_type_handler(jax.Array, original_handler, override=True)
             self._eval_summaries = None
 
     def restore(
@@ -391,8 +350,8 @@ class OrbaxCheckpointer(BaseCheckpointer):
 
         if cfg.enable_single_replica_ckpt_restoring:
             array_handler = ocp.type_handlers.SingleReplicaArrayHandler(
-                replica_axis_index=1,
-                # broadcast_memory_limit_bytes=1024 * 1024 * 1000,  # 1000 MB limit
+                replica_axis_index=0,
+                broadcast_memory_limit_bytes=1024 * 1024 * 1000,  # 1000 MB limit
             )
             ocp.type_handlers.register_type_handler(jax.Array, array_handler, override=True)
 
