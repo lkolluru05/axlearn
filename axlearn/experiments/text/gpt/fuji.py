@@ -828,8 +828,9 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=len(jax.devices()) * 4 * 4096, # number of devices times 4 chips per device times 4096 samples per chip # train_batch_size,
+            train_batch_size=len(jax.devices()), # number of devices times 4 chips per device times 4096 samples per chip # train_batch_size,
             max_step=10_000, # max_step,
+            save_every_n_steps=100,
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=64, model=4),
             mesh_rules=(
                 (
