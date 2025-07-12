@@ -64,7 +64,6 @@ from axlearn.common.attention import (
     RematRegexSavePatterns,
     RepeatedTransformerLayer,
     RoFormerQKVLinear,
-    SlidingWindowKVCache,
     StackedTransformerLayer,
     TransformerAttentionLayer,
     TransformerFeedForwardLayer,
@@ -74,7 +73,6 @@ from axlearn.common.attention import (
     apply_rotary_position_embeddings,
     build_remat_spec,
     compute_padding_biases,
-    enable_sliding_window_attention,
     rel_pos_to_abs_pos,
     scaled_hidden_dim,
     set_double_shard_weights_config,
@@ -85,6 +83,7 @@ from axlearn.common.attention import (
 from axlearn.common.attention_bias import (
     NEG_INF,
     CausalAttentionBias,
+    SlidingWindowAttentionBias,
     bool_to_bias,
     causal_mask,
     make_causal_biases,
@@ -105,6 +104,8 @@ from axlearn.common.config import (
     maybe_set_config,
 )
 from axlearn.common.decoder import Decoder, TransformerTextEmbeddings
+from axlearn.common.kv_cache.paged_kv_cache import PagedKVCache
+from axlearn.common.kv_cache.sliding_window_kv_cache import enable_sliding_window_attention
 from axlearn.common.layers import RMSNorm, set_bias_recursively
 from axlearn.common.module import InvocationContext, Module
 from axlearn.common.module import functional as F
@@ -2471,9 +2472,11 @@ class MultiheadAttentionTest(TestCase):
         *,
         model_dim: int,
         num_heads: int,
+        num_kv_heads: int,
         dtype: jnp.dtype,
         bias: bool,
         extend_step_len: int,
+        page_size: Optional[int],  # None means not using PagedKVCache
     ):
         cfg = attention_cfg.set(
             query_dim=model_dim,
@@ -2487,7 +2490,8 @@ class MultiheadAttentionTest(TestCase):
 
         layer_params = layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
 
-        batch_size, tgt_len = 2, 6
+        batch_size = 2
+        tgt_len = 6 if page_size is None else max(6, page_size * 3)
         head_dim = model_dim // num_heads
         query = jax.random.normal(
             jax.random.PRNGKey(123), [batch_size, tgt_len, model_dim], dtype=dtype
@@ -2530,6 +2534,18 @@ class MultiheadAttentionTest(TestCase):
             query=TensorSpec([batch_size, tgt_len], dtype=dtype),
             kv_state=kv_state,
         )
+        if page_size is not None:
+            # populate the kv_pages and page_indices
+            max_pages_each_request = (tgt_len + page_size - 1) // page_size
+            num_global_pages = batch_size * max_pages_each_request
+            for k in ["key", "value"]:
+                initial_state["kv_cache"][k] = jnp.zeros(
+                    shape=[num_kv_heads, num_global_pages, page_size, head_dim]
+                ).astype(dtype)
+            initial_state["kv_cache"]["page_indices"] = jnp.arange(num_global_pages).reshape(
+                (batch_size, max_pages_each_request)
+            )
+
         self.assertIsNone(initial_output)
         if kv_state is None:
             for k in ["key", "value"]:
@@ -2558,18 +2574,21 @@ class MultiheadAttentionTest(TestCase):
             decoder_output.append(extend_step_outputs.data)
             decoder_probs.append(extend_step_outputs.probs)
         decoder_output = jnp.concatenate(decoder_output, axis=1)
-        assert_allclose(decoder_output, forward_outputs.data, atol=1e-6)
+        assert_allclose(
+            decoder_output, forward_outputs.data, atol=1e-6 if dtype == jnp.float32 else 1e-3
+        )
         # When not using KVCache, the source positions are not always full positions.
         # e.g., SlidingWindowKVCache returns probs for only sliding window size.
-        if cfg.kv_cache is None or cfg.kv_cache.klass == KVCache:
+        if cfg.kv_cache is None or cfg.kv_cache.klass in [KVCache, PagedKVCache]:
             decoder_probs = jnp.concatenate(decoder_probs, axis=2)
+            assert decoder_output.shape == forward_outputs.data.shape
+            assert decoder_probs.shape == forward_outputs.probs.shape
             assert_allclose(decoder_probs, forward_outputs.probs, atol=1e-6)
-            self.assertNestedAllClose(
-                extend_step_outputs.kv_state.k_proj, forward_outputs.kv_state.k_proj, atol=1e-6
+            test_k_proj, test_v_proj = layer.kv_cache.maybe_normalize_kv(
+                extend_step_outputs.kv_state
             )
-            self.assertNestedAllClose(
-                extend_step_outputs.kv_state.v_proj, forward_outputs.kv_state.v_proj, atol=1e-6
-            )
+            self.assertNestedAllClose(test_k_proj, forward_outputs.kv_state.k_proj, atol=1e-6)
+            self.assertNestedAllClose(test_v_proj, forward_outputs.kv_state.v_proj, atol=1e-6)
 
     @parameterized.product(
         dtype=(jnp.float32, jnp.float16, jnp.bfloat16),
@@ -2579,6 +2598,8 @@ class MultiheadAttentionTest(TestCase):
         bias=(True, False),
         causal_type=("causal", "sliding_window"),
         extend_step_len=(1, 4),
+        scale_kv_before_cache_update=(False, True),
+        page_size=(None, 16),  # None means not using PagedKVCache
     )
     def test_extend_step(
         self,
@@ -2589,34 +2610,115 @@ class MultiheadAttentionTest(TestCase):
         bias: bool,
         causal_type: str,
         extend_step_len: int,
+        scale_kv_before_cache_update: bool,
+        page_size: Optional[int],
     ):
-        if input_linear in (QLinear, TestQLinearWithKvUpdate) and causal_type == "sliding_window":
-            pytest.skip("QLinear variants don't support sliding window mask.")
+        if input_linear in (QLinear, TestQLinearWithKvUpdate):
+            if causal_type == "sliding_window":
+                pytest.skip("QLinear variants don't support sliding window mask.")
+            if scale_kv_before_cache_update:
+                pytest.skip("QLinear variants don't support scale_kv_before_cache_update=True")
+        if page_size is not None:
+            if extend_step_len > 1:
+                pytest.skip("PagedKVCache doesn't support extending multiple steps yet.")
+            if input_linear in (QLinear, TestQLinearWithKvUpdate):
+                pytest.skip("PagedKVCache doesn't support QLinear yet.")
         model_dim = 16
         num_heads = 4
         if input_linear == attention.RoFormerQKVLinear:
             input_linear = input_linear.default_config().set(rotary_value=False)
         else:
             input_linear = input_linear.default_config()
+
+        kv_cache_class = PagedKVCache if page_size is not None else KVCache
         cfg = attention.MultiheadAttention.default_config().set(
             query_scale=attention.ScaleQuery.default_config().set(per_dim_scale=per_dim_scale),
             atten_logit_cap=atten_logit_cap,
             input_linear=input_linear,
+            kv_cache=kv_cache_class.default_config().set(cache_dtype=dtype),
+            scale_kv_before_cache_update=scale_kv_before_cache_update,
         )
         if causal_type == "causal":
             cfg.mask = CausalAttentionBias.default_config()
         elif causal_type == "sliding_window":
-            cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
+            if page_size is not None:
+                cfg.mask = SlidingWindowAttentionBias.default_config(sliding_window_size=4)
+            else:
+                cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
         else:
             raise ValueError(f"{causal_type} is not supportd.")
         self._test_extend_step(
             cfg,
             model_dim=model_dim,
             num_heads=num_heads,
+            num_kv_heads=num_heads,
             dtype=dtype,
             bias=bias,
             extend_step_len=extend_step_len,
+            page_size=page_size,
         )
+
+    @parameterized.parameters(False, True)
+    def test_prescaled_kv_share(self, scale_kv_before_cache_update: bool):
+        """Tests that we always output the pre-scaled kv_state when input kv_state is set.
+
+        That is, the output kv_state should be equal to the input kv_state if it's set.
+        """
+        model_dim = 16
+        num_heads = 4
+        dtype = jnp.float32
+        batch_size = 2
+        tgt_len = 6
+        head_dim = model_dim // num_heads
+
+        cfg = attention.MultiheadAttention.default_config().set(
+            input_linear=QLinear.default_config(),
+            query_dim=model_dim,
+            key_dim=model_dim,
+            value_dim=model_dim,
+            num_heads=num_heads,
+            dtype=dtype,
+            scale_kv_before_cache_update=scale_kv_before_cache_update,
+        )
+        cfg.key_scale.norm = RMSNorm.default_config().set(input_dim=head_dim)
+
+        layer = cfg.set(name="test").instantiate(parent=None)
+        layer_params = layer.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(123))
+
+        query = jax.random.normal(
+            jax.random.PRNGKey(123), [batch_size, tgt_len, model_dim], dtype=dtype
+        )
+        kv_state = KVState(
+            k_proj=jax.random.normal(
+                jax.random.PRNGKey(124), [batch_size, tgt_len, num_heads, head_dim], dtype=dtype
+            ),
+            v_proj=jax.random.normal(
+                jax.random.PRNGKey(125), [batch_size, tgt_len, num_heads, head_dim], dtype=dtype
+            ),
+            key_positions=jnp.arange(tgt_len)[None],
+        )
+        return_aux = {"probs", "kv_state"}
+        inputs = dict(
+            query=query,
+            key=None,
+            value=None,
+            kv_state=kv_state,
+            return_aux=return_aux,
+        )
+        with self.assertRaises(
+            ValueError
+        ) if scale_kv_before_cache_update else contextlib.nullcontext():
+            forward_outputs, _ = F(
+                layer,
+                state=layer_params,
+                is_training=False,
+                prng_key=jax.random.PRNGKey(456),
+                inputs=inputs,
+            )
+        if scale_kv_before_cache_update:
+            return
+        self.assertNestedEqual(forward_outputs.kv_state.k_proj, kv_state.k_proj)
+        self.assertNestedEqual(forward_outputs.kv_state.v_proj, kv_state.v_proj)
 
     @parameterized.product(
         dtype=(jnp.float32, jnp.float16, jnp.bfloat16),
@@ -2627,6 +2729,7 @@ class MultiheadAttentionTest(TestCase):
         bias=(True, False),
         causal_type=("causal", "sliding_window"),
         extend_step_len=(1, 4),
+        page_size=(None, 1, 16),  # None means not using PagedKVCache.
     )
     def test_gqa_extend_step(
         self,
@@ -2638,27 +2741,38 @@ class MultiheadAttentionTest(TestCase):
         bias: bool,
         causal_type: str,
         extend_step_len: int,
+        page_size: Optional[int],
     ):
+        if page_size is not None:
+            if extend_step_len > 1:
+                pytest.skip("PagedKVCache doesn't support extending multiple steps.")
         model_dim = 16
         num_heads = 4
+        kv_cache_class = PagedKVCache if page_size is not None else KVCache
         cfg = attention.GroupedQueryAttention.default_config().set(
             query_scale=attention.ScaleQuery.default_config().set(per_dim_scale=per_dim_scale),
             atten_logit_cap=atten_logit_cap,
             input_linear=input_linear.default_config().set(num_kv_heads=num_kv_heads),
+            kv_cache=kv_cache_class.default_config().set(cache_dtype=dtype),
         )
         if causal_type == "causal":
             cfg.mask = CausalAttentionBias.default_config()
         elif causal_type == "sliding_window":
-            cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
+            if page_size is not None:
+                cfg.mask = SlidingWindowAttentionBias.default_config(sliding_window_size=4)
+            else:
+                cfg = enable_sliding_window_attention(cfg, sliding_window_size=4)
         else:
             raise ValueError(f"{causal_type} is not supportd.")
         self._test_extend_step(
             cfg,
             model_dim=model_dim,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             dtype=dtype,
             bias=bias,
             extend_step_len=extend_step_len,
+            page_size=page_size,
         )
 
     def _test_prefill_states(
@@ -2739,7 +2853,7 @@ class MultiheadAttentionTest(TestCase):
 
         # When not using KVCache, the source positions are not always full positions.
         # e.g., SlidingWindowKVCache returns probs for only sliding window size.
-        vanilla_kvcache = cfg.kv_cache is None or cfg.kv_cache.klass == KVCache
+        vanilla_kvcache = cfg.kv_cache is None or cfg.kv_cache.klass in [KVCache, PagedKVCache]
         if vanilla_kvcache:
             for proj in ["key", "value"]:
                 self.assertEqual(
@@ -2923,6 +3037,12 @@ class MultiheadAttentionTest(TestCase):
         v = jax.random.uniform(data_key, (batch, seq_len, num_kv_heads, per_head_dim))
         q, k, v = q.astype(jnp.float32), k.astype(kv_dtype), v.astype(kv_dtype)
         attention_logit_biases = attention_logit_biases = attention_bias.ZeroAttentionBias()
+        pos = jnp.arange(seq_len)[None, :]
+        kv_state = KVState(
+            k_proj=k,
+            v_proj=v,
+            key_positions=pos,
+        )
 
         (test_context, ref_probs), _ = F(
             test_layer,
@@ -2933,14 +3053,19 @@ class MultiheadAttentionTest(TestCase):
             inputs=dict(
                 mode=mode,
                 q_proj=q,
-                k_proj=k,
-                v_proj=v,
                 attention_logit_biases=attention_logit_biases,
+                kv_state=kv_state,
             ),
         )
 
         k = jnp.repeat(k, num_heads // num_kv_heads, axis=2)
         v = jnp.repeat(v, num_heads // num_kv_heads, axis=2)
+
+        kv_state = KVState(
+            k_proj=k,
+            v_proj=v,
+            key_positions=pos,
+        )
 
         (ref_context, ref_probs), _ = F(
             ref_layer,
@@ -2951,9 +3076,8 @@ class MultiheadAttentionTest(TestCase):
             inputs=dict(
                 mode=mode,
                 q_proj=q,
-                k_proj=k,
-                v_proj=v,
                 attention_logit_biases=attention_logit_biases,
+                kv_state=kv_state,
             ),
         )
 
@@ -3154,15 +3278,20 @@ class ScaleFunctionsTest(TestCase):
             inputs=dict(q_proj=q_proj, k_proj=k_proj, query_positions=pos, key_positions=pos),
         )
 
+        kv_state = KVState(
+            k_proj=k_proj,
+            v_proj=v_proj,
+            key_positions=pos,
+        )
+
         inputs = dict(
             mode=mode,
             q_proj=q_proj,
-            k_proj=k_proj,
-            v_proj=v_proj,
             attention_logit_biases=attention_bias.CausalAttentionBias(
                 target_positions=jnp.arange(seq_len)[None],
                 source_positions=jnp.arange(seq_len)[None],
             ),
+            kv_state=kv_state,
         )
 
         (context, probs), _ = F(
@@ -5645,154 +5774,6 @@ class ConfigHelperTest(TestCase):
                     cross_atten.output_linear.param_partition_spec,
                     (fsdp_axis_names, tp_axis_names, None),
                 )
-
-
-class KVCacheTest(TestCase):
-    """Tests KVCache."""
-
-    @parameterized.product(
-        cached_kv_length=[8],
-        time_step_value=[2, 4],
-        cache_dtype=[None, jnp.bfloat16],
-        live_step_len=[-1, 2, 4],
-    )
-    def test_kv_cache(self, cached_kv_length, time_step_value, cache_dtype, live_step_len):
-        test_layer = (
-            KVCache.default_config()
-            .set(name="ref", cache_dtype=cache_dtype)
-            .instantiate(parent=None)
-        )
-
-        prng_key = jax.random.PRNGKey(2)
-        batch, step_len = 2, 4
-        heads, dim = 2, 2
-        step_shape = (batch, step_len, heads, dim)
-        k_proj = jax.random.normal(prng_key, shape=step_shape)
-        v_proj = jax.random.normal(prng_key, shape=step_shape)
-        key_positions = jnp.arange(step_len)[None] + time_step_value
-        if live_step_len < 0:
-            valid_step_len = step_len
-            live_step_len = None
-        else:
-            valid_step_len = live_step_len
-            live_step_len = jnp.full([batch], fill_value=live_step_len, dtype=jnp.int32)
-
-        kv_shape = KVCache.Shape(batch, cached_kv_length, heads, dim)
-        test_states = test_layer.init_states(kv_shape, dtype=k_proj.dtype)
-        expect_dtype = cache_dtype or k_proj.dtype
-
-        _, test_output = test_layer.extend_step(
-            test_states,
-            k_proj=k_proj,
-            v_proj=v_proj,
-            key_positions=key_positions,
-            live_step_len=live_step_len,
-        )
-
-        def check(input_kv, output_kv):
-            self.assertEqual(output_kv.shape, kv_shape)
-            self.assertEqual(output_kv.dtype, expect_dtype)
-            assert_allclose(output_kv[:, :time_step_value], 0)
-            assert_allclose(
-                output_kv[:, time_step_value : time_step_value + valid_step_len],
-                input_kv.astype(expect_dtype)[:, :valid_step_len],
-            )
-
-        check(k_proj, test_output.k_proj)
-        check(v_proj, test_output.v_proj)
-        key_positions = jnp.arange(cached_kv_length)[None]
-        assert_allclose(test_output.key_positions, key_positions)
-        # Currently, the part larger than live_step_len is also being overwritten in the KV cache.
-        # TODO(dhwang2): remove this check when KVCache updates only valid part.
-        assert_allclose(
-            test_output.k_proj[:, time_step_value : time_step_value + step_len],
-            k_proj.astype(expect_dtype)[:, :step_len],
-        )
-
-    @parameterized.product(cache_dtype=[None, jnp.bfloat16])
-    def test_kv_cache_onehot_vs_dynamic(self, cache_dtype):
-        test_layer = (
-            KVCache.default_config()
-            .set(name="test", cache_dtype=cache_dtype)
-            .instantiate(parent=None)
-        )
-
-        kv_len = 64
-        kv_shape = KVCache.Shape(2, kv_len, 2, 2)
-        onehot_states = test_layer.init_states(kv_shape, dtype=jnp.float32)
-        dynamic_states = test_layer.init_states(kv_shape, dtype=jnp.float32)
-
-        prng_key = jax.random.PRNGKey(2)
-        k_proj = jax.random.normal(prng_key, shape=kv_shape)
-        v_proj = jax.random.normal(prng_key, shape=kv_shape)
-
-        def extend_step(step_size, cached_states):
-            for i in range(0, kv_len, step_size):
-                k_step = k_proj[:, i : i + step_size]
-                v_step = v_proj[:, i : i + step_size]
-                key_positions = jnp.arange(step_size)[None] + i
-                cached_states, test_output = test_layer.extend_step(
-                    cached_states, k_proj=k_step, v_proj=v_step, key_positions=key_positions
-                )
-            return cached_states, test_output
-
-        onehot_states, onehot_output = extend_step(step_size=1, cached_states=onehot_states)
-        dynamic_states, dynamic_output = extend_step(step_size=32, cached_states=dynamic_states)
-
-        expect_dtype = cache_dtype or k_proj.dtype
-        assert_allclose(onehot_states["key"], dynamic_states["key"])
-        assert_allclose(onehot_states["value"], dynamic_states["value"])
-        self.assertEqual(onehot_states["key"].dtype, dynamic_states["key"].dtype)
-        self.assertEqual(onehot_states["value"].dtype, dynamic_states["value"].dtype)
-        self.assertEqual(onehot_states["key"].dtype, expect_dtype)
-        self.assertEqual(onehot_states["value"].dtype, expect_dtype)
-
-        assert_allclose(onehot_output.k_proj, dynamic_output.k_proj)
-        assert_allclose(onehot_output.v_proj, dynamic_output.v_proj)
-        self.assertEqual(onehot_output.k_proj.dtype, dynamic_output.k_proj.dtype)
-        self.assertEqual(onehot_output.v_proj.dtype, dynamic_output.v_proj.dtype)
-
-        assert_allclose(onehot_output.key_positions, dynamic_output.key_positions)
-
-    @parameterized.product(cached_kv_length=[8], time_step_value=[2, 4, 6], live_step_len=[None, 2])
-    def test_sliding_window_kv_cache(self, cached_kv_length, time_step_value, live_step_len):
-        test_layer = (
-            SlidingWindowKVCache.default_config()
-            .set(name="ref", cached_kv_length=cached_kv_length)
-            .instantiate(parent=None)
-        )
-        batch, step_len = 2, 4
-        step_shape = (batch, step_len, 2, 2)
-        test_states = test_layer.init_states(shape=KVCache.Shape(*step_shape), dtype=jnp.float32)
-        prng_key = jax.random.PRNGKey(2)
-        k_proj = jax.random.normal(prng_key, shape=step_shape)
-        v_proj = jax.random.normal(prng_key, shape=step_shape)
-        key_positions = jnp.arange(step_len)[None] + time_step_value
-        valid_out_len = live_step_len or step_len
-        live_step_len = (
-            jnp.full([batch], fill_value=live_step_len) if live_step_len is not None else None
-        )
-        _, test_output = test_layer.extend_step(
-            test_states,
-            k_proj=k_proj,
-            v_proj=v_proj,
-            key_positions=key_positions,
-            live_step_len=live_step_len,
-        )
-        kv_shape = (2, cached_kv_length + step_len, 2, 2)
-        self.assertEqual(test_output.key_positions.shape, kv_shape[:2])
-        test_key_positions = test_output.key_positions[:, -valid_out_len:]
-        assert_allclose(
-            test_key_positions,
-            jnp.broadcast_to(key_positions[:, :valid_out_len], test_key_positions.shape),
-        )
-        test_mask = (test_output.key_positions[:, :-valid_out_len] >= 0)[:, :, None, None]
-        self.assertEqual(test_output.k_proj.shape, kv_shape)
-        assert_allclose(test_output.k_proj[:, :-valid_out_len] * test_mask, 0)
-        assert_allclose(test_output.k_proj[:, -valid_out_len:], k_proj[:, :valid_out_len])
-        self.assertEqual(test_output.v_proj.shape, kv_shape)
-        assert_allclose(test_output.v_proj[:, :-valid_out_len] * test_mask, 0)
-        assert_allclose(test_output.v_proj[:, -valid_out_len:], v_proj[:, :valid_out_len])
 
 
 class PositionalEmbeddingTest(TestCase):
