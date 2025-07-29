@@ -8,7 +8,7 @@ from absl.testing import parameterized
 
 from axlearn.cloud.common.bundler import Bundler
 from axlearn.cloud.common.utils import define_flags, from_flags
-from axlearn.cloud.gcp import bundler, jobset_utils, pathways_utils
+from axlearn.cloud.gcp import bundler, jobset_utils, lws_utils, pathways_utils
 from axlearn.cloud.gcp.bundler import CloudBuildBundler
 from axlearn.cloud.gcp.pathways_utils import (
     _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY,
@@ -83,6 +83,33 @@ class PathwaysReplicatedJobTest(TestCase):
                 _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
                 node_selector.get(_PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY),
             )
+
+            head_container = pod_spec["containers"][0]
+            env_vars = set()
+            for env_pair in head_container["env"]:
+                env_vars.add(env_pair["name"])
+                # pylint: disable=line-too-long
+                if env_pair["name"] == "NUM_REPLICAS":
+                    self.assertEqual(
+                        env_pair["valueFrom"],
+                        {
+                            "fieldRef": {
+                                "fieldPath": "metadata.annotations['jobset.sigs.k8s.io/replicatedjob-replicas']"
+                            }
+                        },
+                    )
+                # pylint: enable=line-too-long
+                if env_pair["name"] == "REPLICA_ID":
+                    self.assertEqual(
+                        env_pair["valueFrom"],
+                        {
+                            "fieldRef": {
+                                "fieldPath": "metadata.annotations['jobset.sigs.k8s.io/job-index']"
+                            }
+                        },
+                    )
+
+            self.assertTrue({"NUM_REPLICAS", "REPLICA_ID"}.issubset(env_vars))
 
             # Check pathways-proxy container args for XLA flags.
             proxy_container = None
@@ -232,6 +259,34 @@ class PathwaysReplicatedJobTest(TestCase):
             self.assertIn(new_mxla_flag_key, actual_mxla_options)
             self.assertEqual(actual_mxla_options[new_mxla_flag_key], expected_new_mxla_value_parsed)
 
+    def test_validate_head_name(self):
+        with self._job_config(CloudBuildBundler) as (cfg, bundler_cfg):
+            cfg.inner.set(
+                project="test-project",
+                name="a" * 40,
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            with self.assertRaisesRegex(
+                ValueError, r"pathways-head-1-1-abcde exceeds max \(63\) by 1 chars."
+            ):
+                _ = cfg.instantiate(bundler=bundler_cfg.instantiate())
+
+    def test_validate_worker_name(self):
+        with self._job_config(CloudBuildBundler) as (cfg, bundler_cfg):
+            cfg.inner.set(
+                project="test-project",
+                name="a" * 38,
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            with self.assertRaisesRegex(
+                ValueError, r"pathways-worker-1-2-abcde exceeds max \(63\) by 1 chars."
+            ):
+                _ = cfg.instantiate(bundler=bundler_cfg.instantiate())
+
 
 class PathwaysMultiheadReplicatedJobTest(TestCase):
     """Tests PathwaysMultiheadReplicatedJob."""
@@ -296,3 +351,113 @@ class PathwaysMultiheadReplicatedJobTest(TestCase):
                     self.assertEqual(replicated_job["replicas"], num_replicas)
                 elif replicated_job_name.startswith("pathways-worker"):
                     self.assertEqual(replicated_job["replicas"], 1)
+
+    def test_validate_head_name(self):
+        with self._job_config(CloudBuildBundler, 2) as (cfg, bundler_cfg):
+            cfg.inner.set(
+                project="test-project",
+                name="a" * 40,
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+        with self.assertRaisesRegex(
+            ValueError, r"pathways-head-1-1-abcde exceeds max \(63\) by 1 chars."
+        ):
+            _ = cfg.instantiate(bundler=bundler_cfg.instantiate())
+
+    def test_validate_worker_name(self):
+        with self._job_config(CloudBuildBundler, 2) as (cfg, bundler_cfg):
+            cfg.inner.set(
+                project="test-project",
+                name="a" * 36,
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+        with self.assertRaisesRegex(
+            ValueError, r"pathways-worker-2-0-2-abcde exceeds max \(63\) by 1 chars."
+        ):
+            _ = cfg.instantiate(bundler=bundler_cfg.instantiate())
+
+
+class PathwaysLeaderWorkerTemplateTest(TestCase):
+    """Test PathwaysLeaderWorkerTemplate."""
+
+    @contextlib.contextmanager
+    def _job_config(self, bundler_cls: type[Bundler], **kwargs):
+        with mock_gcp_settings([lws_utils.__name__, bundler.__name__]):
+            fv = flags.FlagValues()
+            cfg = pathways_utils.PathwaysLeaderWorkerTemplate.default_config()
+            define_flags(cfg, fv)
+            fv.set_default("name", "fake-name")
+            fv.set_default("instance_type", "tpu-v6e-16")
+            for key, value in kwargs.items():
+                if value is not None:
+                    setattr(fv, key, value)
+            fv.mark_as_parsed()
+            cfg = from_flags(cfg, fv)
+            bundler_cfg = bundler_cls.from_spec([], fv=fv).set(image="test-image")
+            print("debug: cfg: ", type(cfg))
+            yield cfg, bundler_cfg
+
+    def test_build_leader_pod(self):
+        with (
+            self._job_config(
+                CloudBuildBundler,
+            ) as (cfg, bundler_cfg),
+        ):
+            cfg.inner.set(
+                project="test-project",
+                name="a" * 36,
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = builder.build_leader_pod()
+            pod_spec = pod["spec"]
+
+            self.assertEqual(len(pod_spec["containers"]), 3)
+
+    def test_build_worker_pod(self):
+        with (
+            self._job_config(
+                CloudBuildBundler,
+            ) as (cfg, bundler_cfg),
+        ):
+            cfg.inner.set(
+                project="test-project",
+                name="a" * 36,
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            pod = builder.build_worker_pod()
+            pod_spec = pod["spec"]
+            container = pod_spec.get("containers")[0]
+            self.assertEqual(container["image"], _PATHWAYS_SERVER_IMAGE)
+            self.assertEqual(len(container["args"]), 3)
+
+    def test_leader_worker_template(self):
+        with (
+            self._job_config(
+                CloudBuildBundler,
+            ) as (cfg, bundler_cfg),
+        ):
+            cfg.inner.set(
+                project="test-project",
+                name="a" * 36,
+                command="test_command",
+                output_dir="FAKE",
+            ).instantiate(bundler=bundler_cfg.instantiate())
+
+            builder = cfg.instantiate(bundler=bundler_cfg.instantiate())
+            lws = builder()
+            leader_template = lws["leaderTemplate"]
+            worker_template = lws["workerTemplate"]
+
+            self.assertEqual(lws["size"], 5)
+            self.assertEqual(len(leader_template["spec"]["containers"]), 3)
+            self.assertEqual(len(worker_template["spec"]["containers"]), 1)

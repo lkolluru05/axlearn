@@ -30,8 +30,9 @@ core = [
     "nltk==3.7",  # for text preprocessing
     "optax==0.1.7",  # optimizers (0.1.0 has known bugs).
     "portpicker",
+    "pyarrow<21.0.0",  # Pin to v20.x to avoid PyExtensionType -> ExtensionType breaking change in v21
     "protobuf>=3.20.3",
-    "tensorboard-plugin-profile==2.15.1",
+    "tensorboard-plugin-profile==2.20.4",
     # This has both x86 and arm64 wheels. Underneath the hood it uses tensorflow-macos since 2.13.
     "tensorflow==2.17.1",
     "tensorflow-datasets>=4.9.2",
@@ -125,6 +126,7 @@ vertexai_tensorboard = [
 ]
 # Dataflow dependencies.
 dataflow = [
+    "pyarrow<21.0.0",  # Pin to v20.x to avoid PyExtensionType -> ExtensionType breaking change in v21
     "apache-beam==2.55.1",
     "apache-beam[gcp]",
     "google-apitools",  # for beam pipeline
@@ -135,6 +137,8 @@ gpu = [
     "triton==2.1.0",
     "jax[cuda12]==0.5.3",
     "nvidia-ml-py==12.560.30",
+    # pin nccl version, otherwise jax[cuda12] will pull latest version
+    "nvidia-nccl-cu12==2.27.5",
 ]
 # Open API inference.
 open_api = [
@@ -148,13 +152,14 @@ mmau = [
     "plotly==5.22.0",
     "nbconvert==7.16.4",
     "google-cloud-aiplatform==1.50.0",
+    "google-genai==1.25.0",
     "transformers==4.51.3",
     "huggingface-hub==0.24.6",
 ]
 # Orbax checkpointing.
 orbax = [
     "humanize==4.10.0",
-    "orbax-checkpoint==0.11.1",
+    "orbax-checkpoint==0.11.15",
 ]
 # Audio dependencies.
 audio = [

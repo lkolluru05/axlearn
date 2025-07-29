@@ -1,6 +1,9 @@
 # Copyright © 2024 Apple Inc.
 """Runtime and compiler options for JAX/XLA."""
 
+import math
+import os
+
 # This module must not depend on any jax/axlearn modules so that
 # importing this module does not result in initializing jax.
 import re
@@ -22,6 +25,15 @@ def default_xla_options(
     or converted to flags using `xla_flags_from_options` and passed to
     `LIBTPU_INIT_ARGS` (only works on TPU) or `XLA_FLAGS` (works on any platform including TPU)
     before importing jax.
+
+    Environment variable overrides:
+        XLA options can be overridden using the XLA_OPTIONS_OVERRIDE environment variable.
+        The format is a comma-separated list of key=value pairs:
+
+        Example: XLA_OPTIONS_OVERRIDE="xla_tpu_enable_sunk_dcn_allreduce_done_with_host_reduction
+        =false, megascale_grpc_premap_memory_bytes=34359738368"
+
+        Values are used as-is (strings) and validated by the existing validation logic.
 
     Args:
         instance_type: A specifier for the ML accelerator. E.g., "tpu-v5p-2048".
@@ -83,6 +95,10 @@ def default_xla_options(
             # TODO(hanzhi-zhou): temporary workaround to avoid PCIe overload when using multi-slice
             # v6e training caused by allreduce over DCN. This flag doesn't impact performance.
             xla_tpu_iova_dma_chunk_size_bytes=1048576,
+            # Disable collective matmul. Collective matmul could negatively affect performance in
+            # some cases. Even in cases where collective matmul provides gains, the gains are
+            # marginal on v6e due to the high arithmetic intensity.
+            xla_jf_spmd_threshold_for_windowed_einsum_mib=1000000,
         )
 
         # These flags enable SparseCore (SC).
@@ -151,6 +167,9 @@ def default_xla_options(
             megascale_grpc_enable_xor_tracer="false",
         )
 
+    # Apply environment variable overrides
+    options = _apply_overrides_from_env(options)
+
     # Validate options. Will never fail if this function is implemented correctly.
     for k, v in options.items():
         try:
@@ -160,6 +179,69 @@ def default_xla_options(
             assert v in [True, False, "true", "false", "megachip_tccontrol", "10m"], (k, v)
 
     return options
+
+
+def _apply_overrides_from_env(
+    options: dict[str, Union[str, bool, int]]
+) -> dict[str, Union[str, bool, int]]:
+    """Apply environment variable overrides to XLA options.
+
+    Reads the XLA_OPTIONS_OVERRIDE environment variable and parses it as a comma-separated
+    list of key=value pairs to override XLA options.
+
+    Args:
+        options: The original XLA options dictionary.
+
+    Returns:
+        A new dictionary with environment variable overrides applied.
+    """
+    override_env = os.environ.get("XLA_OPTIONS_OVERRIDE")
+    if not override_env:
+        return options
+
+    overridden_options = options.copy()
+    try:
+        # Parse comma-separated key=value pairs
+        for pair in override_env.split(","):
+            if not pair:
+                continue
+
+            if "=" not in pair:
+                logging.warning("Invalid XLA option override format (missing '='): %s", pair)
+                continue
+
+            key, value = pair.split("=", 1)  # Split only on first '=' in case value contains '='
+            key = key.strip()
+            value = value.strip()
+
+            if not key:
+                logging.warning("Empty key in XLA option override: %s", pair)
+                continue
+
+            # Log the override
+            if key in overridden_options:
+                logging.info(
+                    "Overriding XLA option %s: %s -> %s",
+                    key,
+                    overridden_options[key],
+                    value,
+                )
+            else:
+                logging.info(
+                    "Adding new XLA option %s: %s",
+                    key,
+                    value,
+                )
+
+            overridden_options[key] = value
+
+    # pylint: disable-next=broad-exception-caught
+    except Exception as e:
+        logging.error("Error parsing XLA_OPTIONS_OVERRIDE: %s", e)
+        # Return original options on parse error
+        return options
+
+    return overridden_options
 
 
 def xla_flags_from_options(xla_options: dict[str, Union[str, bool, int]]) -> str:
@@ -252,8 +334,9 @@ def infer_xsc_compiler_options(
         xla_tpu_sdc_checker_alternate_megacore_cores=True,
         # XLA ICI SDC Checker flags:
         # N.B. ICI checker only runs once after first program compilation.
-        # Enable the interconnect checker on first program call.
-        xla_tpu_ici_sdc_test_run_on_program_start=True,
+        # Disable the interconnect checker by default as it is not meant for production run.
+        # In a large scale job, disabling it reduced compilation time from 18mins to 15s.
+        xla_tpu_ici_sdc_test_run_on_program_start=False,
         # Max distance between send/recv neighbours.
         xla_tpu_ici_sdc_test_max_distance=1,
         # Number of repeated send/recv before checking for equivalence.
@@ -282,17 +365,19 @@ def infer_xla_performance_flags(
         return {}
     # Sparse core offloading all collectives can improve performance of model parallelism on
     # v6e. However, it negative impacts the performance of some pure FSDP runs by about 6%.
-    # Therefore, we enable them selectively on mesh shapes that have model parallelism.
+    # Therefore, we enable them selectively on mesh shapes that have model parallelism and are
+    # verified to have improved performance with sparse core offloading.
     # TODO(hanzhi-zhou): Check if these flags also improve performance on fsdp=16, model=16.
-    target_configurations = [dict(fsdp=32, model=8), dict(fsdp=64, model=4)]
+    mesh_configurations_for_sparse_core_offloading = []
+    for a, b in [(32, 8), (64, 4), (16, 8)]:
+        mesh_configurations_for_sparse_core_offloading.append(dict(fsdp=a, track=b))
+        mesh_configurations_for_sparse_core_offloading.append(dict(fsdp=a, model=b))
     current_configuration = {}
     for name, size in zip(mesh_axis_names, mesh_shape):
-        if name in ("fsdp", "model"):
+        if name in ("fsdp", "track", "model") and size != 1:
             current_configuration[name] = size
-    if current_configuration in target_configurations:
+    if current_configuration in mesh_configurations_for_sparse_core_offloading:
         flags = dict(
-            # Perf optimization.
-            xla_tpu_sparse_core_all_gather_latency_multiplier="2",
             # Must disable continuation fusion to enable sparse core offloading.
             xla_tpu_enable_async_collective_fusion_fuse_all_gather="false",
             xla_tpu_enable_async_collective_fusion_fuse_all_reduce="false",
@@ -304,6 +389,12 @@ def infer_xla_performance_flags(
             xla_tpu_enable_reduce_scatter_offload_tracing="true",
             xla_tpu_enable_all_reduce_offload_tracing="true",
         )
+        # 64x4 and 32x8 are non-native mesh shapes for v6e-256. The only native native for v6e-256
+        # is 16x16 (or 256). The available bandwidth of non-native mesh shapes is half of that
+        # compared to the native mesh shape. Specify the latency modifier so that the latency
+        # hiding scheduler can model the actual latency better.
+        if math.prod(current_configuration.values()) == 256:
+            flags.update(xla_tpu_sparse_core_all_gather_latency_multiplier="2")
         logging.log_first_n(
             logging.INFO,
             "Adding new XLA flags for %s:\n%s",
