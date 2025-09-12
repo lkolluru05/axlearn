@@ -414,9 +414,17 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 }
             )
 
+        # node_selector = {
+        #     _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
+        # }
+
+        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+        #pod_spec["nodeSelector"].update(
         node_selector = {
-            _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
-        }
+                "cloud.google.com/gke-tpu-accelerator": system.gke_accelerator,
+                "cloud.google.com/gke-tpu-topology": system.topology,
+            }
+        #)
 
         head_container = self._build_pathways_head_container()
         init_containers = [
