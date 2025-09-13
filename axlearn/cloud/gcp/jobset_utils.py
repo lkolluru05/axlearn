@@ -572,6 +572,7 @@ class TPUJobBuilder(SingleReplicatedJob):
         annotations, labels, selector, volumes, tolerations = {}, {}, {}, [], []
 
         volumes.append(dict(name="shared-output", emptyDir={}))
+
         if cfg.gcsfuse_mount:
             # Increases the shared memory volumes when enabled gcsfuse. This is useful when grain
             # prefetch is enabled.
@@ -769,11 +770,23 @@ class TPUReplicatedJob(TPUJobBuilder):
         """See `BaseReplicatedJob` docstring for details."""
         cfg: TPUReplicatedJob.Config = self.config
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
+        
+        annotations=self._load_balancer.metadata
+        annotations["kueue.x-k8s.io/podset-slice-required-topology"]="cloud.google.com/gke-tpu-slice-8x8-id"
+        annotations["kueue.x-k8s.io/podset-slice-size"]="16"
+        annotations["cloud.google.com/gke-tpu-subslice-topology"]="8x8"
+
+            
+                # "kueue.x-k8s.io/podset-slice-required-topology": "cloud.google.com/gke-tpu-slice-8x8-id",
+                # "kueue.x-k8s.io/podset-slice-size": "4",
+                # "cloud.google.com/gke-tpu-subslice-topology": "8x8",
+            
+        
         job_spec = dict(
-            metadata=dict(annotations=self._load_balancer.metadata),
+            metadata=dict(annotations=annotations),
             spec=dict(
-                parallelism=system.vms_per_slice,
-                completions=system.vms_per_slice,
+                parallelism=16,#system.vms_per_slice,
+                completions=16,#system.vms_per_slice,
                 backoffLimit=0,  # Fail the job if any node fails. Retries happen at JobSet level.
                 template=self._build_pod(),
             ),

@@ -156,10 +156,12 @@ class GKEJob(GCPJob):
         """
         cfg: GKEJob.Config = self.config
         annotations = maybe_instantiate(cfg.annotations or {})
+        labels={}
         if cfg.queue:
             annotations["kueue.x-k8s.io/queue-name"] = cfg.queue
+            labels["kueue.x-k8s.io/queue-name"] = cfg.queue
         return dict(
-            metadata=dict(name=cfg.name, annotations=annotations),
+            metadata=dict(name=cfg.name, annotations=annotations, labels=labels),
             spec=dict(
                 failurePolicy=dict(maxRestarts=cfg.max_tries - 1),
                 replicatedJobs=self._builder(),
