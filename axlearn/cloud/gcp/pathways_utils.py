@@ -6,7 +6,7 @@ import copy
 import logging
 import os
 from typing import Any, Optional, Sequence, Union
-
+from kubernetes import client
 from absl import flags
 
 from axlearn.cloud.common.bastion import BASTION_JOB_VERSION_ENV_VAR
@@ -107,7 +107,7 @@ def get_pathways_tpu_version(gke_machine_type: str) -> str:
 
 
 def get_megascale_options(
-    xla_options: dict[str, Union[str, bool, int]]
+    xla_options: dict[str, Union[str, bool, int]],
 ) -> dict[str, Union[str, bool, int]]:
     """Filters XLA options for those pertaining to Megascale.
 
@@ -122,7 +122,7 @@ def get_megascale_options(
 
 
 def get_xla_options(
-    xla_options: dict[str, Union[str, bool, int]]
+    xla_options: dict[str, Union[str, bool, int]],
 ) -> dict[str, Union[str, bool, int]]:
     """Filters XLA options for those starting with 'xla_'.
 
@@ -146,12 +146,14 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             inner: The wrapped TPUReplicatedJob configuration.
             pathways_head_cpu: CPU request for pathways-head container.
             pathways_head_mem: Memory request for pathways-head container.
+            pathways_head_on_tpu: Whether to run pathways head on TPU VM.
         """
 
         inner: Required[TPUReplicatedJob.Config] = REQUIRED
         pathways_xla_flags: list[str] = []
         pathways_head_cpu: Optional[str] = None
         pathways_head_mem: Optional[str] = None
+        pathways_head_on_tpu: bool = False
 
     @classmethod
     def define_flags(cls, fv):
@@ -178,6 +180,12 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "pathways_head_mem",
             None,
             "Memory request for pathways-head container in GiB. Default is 16GiB",
+            **common_kwargs,
+        )
+        flags.DEFINE_boolean(
+            "pathways_head_on_tpu",
+            True,
+            "If True, run pathways head on TPU VM.",
             **common_kwargs,
         )
 
@@ -315,7 +323,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         mem_req = f"{self.config.pathways_head_mem}Gi"
         resources = {
             "requests": {"cpu": cpu_req, "memory": mem_req},
-            "limits": {"cpu": cpu_req, "memory": mem_req},
+            # "limits": {"cpu": cpu_req, "memory": mem_req},
         }
         head_container["resources"] = resources
 
@@ -414,17 +422,22 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 }
             )
 
-        # node_selector = {
-        #     _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
-        # }
-
-        system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
-        #pod_spec["nodeSelector"].update(
-        node_selector = {
-                "cloud.google.com/gke-tpu-accelerator": system.gke_accelerator,
-                "cloud.google.com/gke-tpu-topology": system.topology,
+        if self.config.pathways_head_on_tpu:
+            # pylint: disable-next=protected-access
+            pod = self._inner._build_pod()
+            node_selector = {}
+            tolerations = pod["spec"]["tolerations"]
+            tolerations.append(
+                client.V1Toleration(
+                key="google.com/tpu",
+                operator="Exists",
+                effect="NoSchedule",
+                )
+            )
+        else:
+            node_selector = {
+                _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
             }
-        #)
 
         head_container = self._build_pathways_head_container()
         init_containers = [
@@ -445,6 +458,26 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "hostAliases": [metadata_host_alias],
             "nodeSelector": node_selector,
             "tolerations": tolerations,
+            "affinity": {
+                "podAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [
+                        {
+                            "labelSelector": {
+                                "matchExpressions": [
+                                    {
+                                        "key": "batch.kubernetes.io/job-name",
+                                        "operator": "In",
+                                        "values": [
+                                            f"{cfg.name}-{_PATHWAYS_WORKER_REPLICATED_JOB_NAME}-0"
+                                        ],
+                                    }
+                                ]
+                            },
+                            "topologyKey": "kubernetes.io/hostname",
+                        }
+                    ]
+                }
+            },
             "containers": [head_container],
             "initContainers": init_containers,
             "volumes": volumes,
@@ -452,6 +485,11 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "hostNetwork": True,
             "dnsPolicy": "ClusterFirstWithHostNet",
         }
+
+        # Remove host ports to avoid scheduling conflicts on the same node.
+        # The pod runs on host network anyway, so the ports are still accessible.
+        if "ports" in head_pod_spec["containers"][0]:
+            del head_pod_spec["containers"][0]["ports"]
 
         if cfg.priority_class:
             head_pod_spec["priorityClassName"] = cfg.priority_class
@@ -545,6 +583,17 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             f"--resource_manager_address={pathways_head_address}:"
             + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
+            # Set premap buffer to 17GB, needed for faster jax.device_put h2d
+            # "--pathways_tpu_premapped_buffer_size=17179869184" doesn't work in cloud
+            # Below flags did not help on 7b restore time
+            # Recycle vs on-demand seems to give a slight perf boost
+            "--tpu_pinned_host_allocation_recycle=true",
+            # pylint: disable=line-too-long
+            # "--temporary_flags_for_debugging=temporary_flag_for_debugging_tpu_premapped_buffer_size=68719476736",
+            # "--temporary_flags_for_debugging=temporary_flag_for_debuggings_max_num_threads_for_xla_compilation=1000"
+            # "--temporary_flags_for_debugging=temporary_flag_for_debugging_xla_max_inflight_async_computations=1000",
+            # "--temporary_flags_for_debugging=temporary_flag_for_debugging_xla_tpu_allow_async_allocations=true",
+            # "--temporary_flags_for_debugging=temporary_flag_for_debugging_tpu_num_premapped_partitions=65536",
         ]
         mega_scale_args = xla_flags_from_options(self._mxla_options).split()
         worker_container["args"].extend(mega_scale_args)
@@ -642,18 +691,23 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
     def __call__(self) -> Sequence[Nested[Any]]:
         cfg: TPUReplicatedJob.Config = self._inner.config
 
-        replicated_jobs = [
-            dict(
-                name=_PATHWAYS_HEAD_REPLICATED_JOB_NAME,
-                replicas=1,
-                template=self._build_pathways_head_job(),
-            ),
-            dict(
-                name=_PATHWAYS_WORKER_REPLICATED_JOB_NAME,
-                replicas=cfg.accelerator.num_replicas,
-                template=self._build_pathways_worker_job(),
-            ),
-        ]
+        worker_job = dict(
+            name=_PATHWAYS_WORKER_REPLICATED_JOB_NAME,
+            replicas=cfg.accelerator.num_replicas,
+            template=self._build_pathways_worker_job(),
+        )
+        head_job = dict(
+            name=_PATHWAYS_HEAD_REPLICATED_JOB_NAME,
+            replicas=1,
+            template=self._build_pathways_head_job(),
+        )
+        if self.config.pathways_head_on_tpu:
+            head_job["dependsOn"] = [
+                dict(name=_PATHWAYS_WORKER_REPLICATED_JOB_NAME, status="Ready")
+            ]
+            replicated_jobs = [worker_job, head_job]
+        else:
+            replicated_jobs = [head_job, worker_job]
 
         return replicated_jobs
 
@@ -908,6 +962,14 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
                 "--instance_count=1",
                 f"--instance_type={pathways_tpu_version}:{system.topology}",
                 f"--gcs_scratch_location={staging_location}",
+                # Troubleshooting perf
+                "--tpu_pinned_host_allocation_recycle=true",
+                # pylint: disable=line-too-long
+                # "--temporary_flags_for_debugging=temporary_flag_for_debugging_tpu_premapped_buffer_size=68719476736",
+                # "--temporary_flags_for_debugging=temporary_flag_for_debuggings_max_num_threads_for_xla_compilation=1000"
+                # "--temporary_flags_for_debugging=temporary_flag_for_debugging_xla_max_inflight_async_computations=1000",
+                # "--temporary_flags_for_debugging=temporary_flag_for_debugging_xla_tpu_allow_async_allocations=true",
+                # "--temporary_flags_for_debugging=temporary_flag_for_debugging_tpu_num_premapped_partitions=65536",
             ],
             ports=[dict(containerPort=_PATHWAYS_RESOURCE_MANAGER_PORT)],
         )
@@ -918,7 +980,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         mem_req = f"{self.config.pathways_head_mem}Gi"
         resources = {
             "requests": {"cpu": cpu_req, "memory": mem_req},
-            "limits": {"cpu": cpu_req, "memory": mem_req},
+            # "limits": {"cpu": cpu_req, "memory": mem_req},
         }
         return dict(
             name=cfg.name,
@@ -944,9 +1006,9 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             ],
             imagePullPolicy="Always",
             resources=resources,
-            ports=[dict(containerPort=self.config.target_port)]
-            if self.config.enable_service
-            else [],
+            ports=(
+                [dict(containerPort=self.config.target_port)] if self.config.enable_service else []
+            ),
         )
 
     def build_leader_pod(self) -> Nested[Any]:
