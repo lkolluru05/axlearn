@@ -40,7 +40,7 @@ def named_runner_configs(
         "gke_tpu_single": GKERunnerJob.default_config().set(
             inner=GKEJob.default_config().set(
                 builder=TPUReplicatedJob.default_config(),
-                annotations=config_for_function(exclusive_topology_annotations),
+                annotations={},#config_for_function(exclusive_topology_annotations),
             ),
             pre_provisioner=TPUNodePoolProvisioner.default_config(),
         ),

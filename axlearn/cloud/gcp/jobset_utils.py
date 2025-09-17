@@ -772,9 +772,9 @@ class TPUReplicatedJob(TPUJobBuilder):
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         
         annotations=self._load_balancer.metadata
-        annotations["kueue.x-k8s.io/podset-slice-required-topology"]="cloud.google.com/gke-tpu-slice-8x8-id"
-        annotations["kueue.x-k8s.io/podset-slice-size"]="16"
-        annotations["cloud.google.com/gke-tpu-subslice-topology"]="8x8"
+        annotations["kueue.x-k8s.io/podset-slice-required-topology"]="cloud.google.com/gke-tpu-slice-2x2-id"
+        annotations["kueue.x-k8s.io/podset-slice-size"]="2"
+        annotations["cloud.google.com/gke-tpu-slice-topology"]="2x2"
 
             
                 # "kueue.x-k8s.io/podset-slice-required-topology": "cloud.google.com/gke-tpu-slice-8x8-id",
@@ -785,8 +785,8 @@ class TPUReplicatedJob(TPUJobBuilder):
         job_spec = dict(
             metadata=dict(annotations=annotations),
             spec=dict(
-                parallelism=16,#system.vms_per_slice,
-                completions=16,#system.vms_per_slice,
+                parallelism=2,#system.vms_per_slice,
+                completions=2,#system.vms_per_slice,
                 backoffLimit=0,  # Fail the job if any node fails. Retries happen at JobSet level.
                 template=self._build_pod(),
             ),

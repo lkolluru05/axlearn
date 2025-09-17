@@ -1,0 +1,50 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: lkolluru-tas-2x4
+  labels:
+    kueue.x-k8s.io/queue-name: multislice-queue
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: subslice-job
+      replicas: 1
+      template:
+        spec:
+          parallelism: 2
+          completions: 2
+          template:
+            metadata:
+              annotations:
+                kueue.x-k8s.io/podset-slice-required-topology: "cloud.google.com/gke-tpu-slice-2x4-id"
+                kueue.x-k8s.io/podset-slice-size: "2"
+                cloud.google.com/gke-tpu-slice-topology: 2x4
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+                cloud.google.com/gke-tpu-topology: 4x4
+              containers:
+              - name: jax
+                image: python:3.12
+                ports:
+                - containerPort: 8471
+                - containerPort: 8080
+                command:
+                - bash
+                - -c
+                - |
+                  printenv
+
+
+                  pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+                  python -c 'import os; print(os.environ, flush=True); import jax; print("Global device count:", jax.device_count(), "Local device count:", jax.local_device_count())'
+                  sleep 600
+                securityContext:
+                  privileged: true
+                resources:
+                  requests:
+                    google.com/tpu: 4
+                  limits:
+                    google.com/tpu: 4
+              restartPolicy: Never

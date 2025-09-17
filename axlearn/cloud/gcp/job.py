@@ -158,7 +158,7 @@ class GKEJob(GCPJob):
         annotations = maybe_instantiate(cfg.annotations or {})
         labels={}
         if cfg.queue:
-            annotations["kueue.x-k8s.io/queue-name"] = cfg.queue
+            #annotations["kueue.x-k8s.io/queue-name"] = cfg.queue
             labels["kueue.x-k8s.io/queue-name"] = cfg.queue
         return dict(
             metadata=dict(name=cfg.name, annotations=annotations, labels=labels),
