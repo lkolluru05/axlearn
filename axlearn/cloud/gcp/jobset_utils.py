@@ -570,6 +570,9 @@ class TPUJobBuilder(SingleReplicatedJob):
         cfg: TPUJobBuilder.Config = self.config
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         annotations, labels, selector, volumes, tolerations = {}, {}, {}, [], []
+        annotations["kueue.x-k8s.io/podset-slice-required-topology"]="cloud.google.com/gke-tpu-slice-2x4-id"
+        annotations["kueue.x-k8s.io/podset-slice-size"]="2"
+        annotations["cloud.google.com/gke-tpu-slice-topology"]="2x4"
 
         volumes.append(dict(name="shared-output", emptyDir={}))
 
@@ -772,15 +775,6 @@ class TPUReplicatedJob(TPUJobBuilder):
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         
         annotations=self._load_balancer.metadata
-        annotations["kueue.x-k8s.io/podset-slice-required-topology"]="cloud.google.com/gke-tpu-slice-2x2-id"
-        annotations["kueue.x-k8s.io/podset-slice-size"]="2"
-        annotations["cloud.google.com/gke-tpu-slice-topology"]="2x2"
-
-            
-                # "kueue.x-k8s.io/podset-slice-required-topology": "cloud.google.com/gke-tpu-slice-8x8-id",
-                # "kueue.x-k8s.io/podset-slice-size": "4",
-                # "cloud.google.com/gke-tpu-subslice-topology": "8x8",
-            
         
         job_spec = dict(
             metadata=dict(annotations=annotations),
