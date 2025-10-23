@@ -1156,13 +1156,15 @@ class Checkpointer(BaseCheckpointer):
         checkpoint has been written.
         """
         cfg: Checkpointer.Config = self.config
-
+        
         def validate_and_restore(*, step: int, ckpt_dir: str):
+
             ckpt_index = os.path.join(ckpt_dir, "index")
             if not self._index_exists(ckpt_dir):
                 raise ValueError(
                     f"Checkpoint {ckpt_dir} is incomplete -- expected {ckpt_index} to be present."
                 )
+            start_time=time.perf_counter()
             restored_state = self._storage.restore_from_dir(
                 step=step, state=state, ckpt_dir=ckpt_dir
             )
@@ -1174,12 +1176,16 @@ class Checkpointer(BaseCheckpointer):
                     ckpt_dir=ckpt_dir,
                     action=CheckpointerAction.RESTORE,
                 )
+            logging.info("restore_time by Gayathri: %s", time.perf_counter()-start_time)
             return restored_state
-
+        logging.info("Checkpointer restore by Gayathri")
+        #logging.info("c: %s", self.ckpt_dir(step))
         if step is not None:
             # For a specified step, we try to load it.
             ckpt_dir = self.ckpt_dir(step)
             return step, validate_and_restore(step=step, ckpt_dir=ckpt_dir)
+
+        logging.info("Checkpointer restore by Gayathri, step 2")
 
         try:
             # Latest checkpoint path, if it exists, is guaranteed to be complete.
