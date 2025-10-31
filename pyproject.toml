@@ -67,7 +67,7 @@ dev = [
     "pytest",  # test runner
     "pytest-xdist",  # pytest plugin for test parallelism
     "pytest-timeout",  # pytest plugin for forcing timeout of tests
-    "pytype==2022.4.22",  # type checking
+    "pytype==2024.10.11",  # type checking
     "scikit-learn==1.5.2",  # test-only
     # Fix AttributeError: module 'scipy.linalg' has no attribute 'tril' and related scipy import errors.
     "scipy>=1.12.0",
