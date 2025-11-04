@@ -105,7 +105,7 @@ RUN if [ "$INSTALL_PATHWAYS_JAXLIB" = "true" ]; then \
       uv pip install --prerelease=allow "jaxlib==0.5.3.dev20250918" \
         --find-links https://storage.googleapis.com/axlearn-wheels/wheels.html; \
     fi
-RUN uv pip install -qq --no-deps libtpu==0.0.26.dev20251022+nightly && uv cache clean
+RUN uv pip install -qq --no-deps libtpu==0.0.28.dev20251104+nightly && uv cache clean
 COPY . .
 
 ################################################################################
