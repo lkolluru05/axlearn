@@ -416,38 +416,38 @@ USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS = {
     "v6e-256": _SystemCharacteristics(
         "16x16", 64, "tpu-v6e-slice", "ct6e-standard-4t", 4, AcceleratorType["TPU"], "v6e-256"
     ),
-    # v7x
-    "v7x-8": _SystemCharacteristics(
+    # 7x
+    "7x-8": _SystemCharacteristics(
         "2x2x1", 1, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-8"
     ),
-    "v7x-16": _SystemCharacteristics(
+    "7x-16": _SystemCharacteristics(
         "2x2x2", 2, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-16"
     ),
-    "v7x-32": _SystemCharacteristics(
+    "7x-32": _SystemCharacteristics(
         "2x2x4", 4, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-32"
     ),
-    "v7x-64": _SystemCharacteristics(
+    "7x-64": _SystemCharacteristics(
         "2x4x4", 8, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-64"
     ),
-    "v7x-128": _SystemCharacteristics(
+    "7x-128": _SystemCharacteristics(
         "4x4x4", 16, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-128"
     ),
-    "v7x-256": _SystemCharacteristics(
+    "7x-256": _SystemCharacteristics(
         "4x4x8", 32, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-256"
     ),
-    "v7x-512": _SystemCharacteristics(
+    "7x-512": _SystemCharacteristics(
         "4x8x8", 64, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-512"
     ),
-    "v7x-1024": _SystemCharacteristics(
+    "7x-1024": _SystemCharacteristics(
         "8x8x8", 128, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-1024"
     ),
-    "v7x-2048": _SystemCharacteristics(
+    "7x-2048": _SystemCharacteristics(
         "8x8x16", 256, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-2048"
     ),
-    "v7x-4096": _SystemCharacteristics(
+    "7x-4096": _SystemCharacteristics(
         "8x16x16", 512, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-4096"
     ),
-    "v7x-8192": _SystemCharacteristics(
+    "7x-8192": _SystemCharacteristics(
         "16x16x16", 1024, "tpu7x", "tpu7x-standard-4t", 4, AcceleratorType["TPU"], "v7x-8192"
     ),
     # v4
@@ -530,6 +530,7 @@ GCE_MACHINE_TYPE_TO_MEMORY_CHARACTERISTICS = {
     "ct4p-hightpu-4t": 407,
     "ct5lp-hightpu-4t": 192,
     "ct6e-standard-4t": 720,
+    "tpu7x-standard-4t": 960,
 }
 
 # Reference doc https://cloud.google.com/kubernetes-engine/docs/concepts/plan-tpus
@@ -537,6 +538,7 @@ GCE_MACHINE_TYPE_TO_CPU_CHARACTERISTICS = {
     "ct5p-hightpu-4t": 208,
     "ct4p-hightpu-4t": 240,
     "ct6e-standard-4t": 180,
+    "tpu7x-standard-4t": 224,
 }
 
 

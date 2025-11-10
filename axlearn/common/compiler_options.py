@@ -132,7 +132,7 @@ def default_xla_options(
             xla_should_add_loop_invariant_op_in_chain="true",
             xla_tpu_use_enhanced_launch_barrier="true",
         )
-    if version == "v7x":
+    if version == "7x":
         options.update(
             # Many of the v7x flags are similar to v6e
             xla_tpu_scoped_vmem_limit_kib=65536,
@@ -307,7 +307,7 @@ class NotTpuError(ValueError):
 def infer_tpu_type(instance_type: str) -> str:
     """Infers tpu type (e.g. v4-8 or v6e-8-1) from instance type
     (e.g. tpu-v4-8, v4-8, tpu-v6e-8-1 or v6e-8-1)."""
-    if not (instance_type and re.fullmatch(r"(tpu-)?v.+-\d+", instance_type)):
+    if not (instance_type and re.fullmatch(r"(tpu-)?v?.+-\d+", instance_type)):
         raise NotTpuError(f"Invalid TPU instance: {instance_type}")
     return instance_type.replace("tpu-", "")
 
@@ -399,7 +399,7 @@ def infer_xsc_compiler_options(
 
 
 _TPU_VERSION_ALIASES = {"v5e": "v5litepod"}
-_TPU_VERSIONS = ("v3", "v4", "v5litepod", "v5p", "v6e", "v7x")
+_TPU_VERSIONS = ("v3", "v4", "v5litepod", "v5p", "v6e", "7x")
 
 
 def infer_xla_performance_flags(
