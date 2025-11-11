@@ -293,6 +293,7 @@ class PosEmbeddingConverterTest(TestCase):
                 embedding_cfg=bert.bert_embedding_config(max_position_embeddings=max_len),
                 stack_cfg=bert.bert_transformer_config(num_layers=3, num_heads=2),
             ),
+            mesh_axis_names=("fsdp", "model")
         )
 
     def _mock_bert_trainer_config_and_state(
