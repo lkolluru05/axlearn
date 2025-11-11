@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axlearn"
-version = "0.1.9"
+version = "0.2.0"
 description = "AXLearn"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,7 +13,7 @@ requires-python = ">=3.12"
 # Minimal requirments for axlearn/common/config.py.
 dependencies = [
     "attrs>=23.1.0", # We use `type` in `attrs.field`
-    "numpy>=1.26.4",  # verified with tensorflow 2.14 RaggedTensor
+    "numpy>2,<3",  # verified with tensorflow 2.14 RaggedTensor
 ]
 
 [project.optional-dependencies]
@@ -23,8 +23,8 @@ core = [
     "absl-py==2.3.1",
     "chex==0.1.91",
     "importlab==0.8.1",  # breaks pytype on 0.8
-    "jax== 0.8.1.dev20251107",
-    "jaxlib== 0.8.1.dev20251107",
+    "jax==0.8.0",
+    "jaxlib==0.8.0",
     "ml-dtypes==0.5.3",
     "msgpack==1.1.0",  # for checkpointing.
     "nltk==3.7",  # for text preprocessing
@@ -107,7 +107,7 @@ gcp = [
 # Note: Specify -f https://storage.googleapis.com/jax-releases/libtpu_releases.html during install.
 tpu = [
     "axlearn[gcp]",
-    "jax[tpu]== 0.8.1.dev20251107",  # must be >=0.4.19 for compat with v5p.
+    "jax[tpu]==0.8.0",  # must be >=0.4.19 for compat with v5p.
     "pathwaysutils==0.1.1",  # For JAX+Pathways single-controller accelerator coordinator.
 ]
 # Vertex AI tensorboard. TODO(markblee): Merge with `gcp`.
@@ -125,7 +125,7 @@ vertexai_tensorboard = [
 # Dataflow dependencies.
 dataflow = [
     "pyarrow<21.0.0",  # Pin to v20.x to avoid PyExtensionType -> ExtensionType breaking change in v21
-    "apache-beam==2.68.0",
+    "apache-beam==2.69.0",
     "apache-beam[gcp]",
     "google-apitools",  # for beam pipeline
     "orjson==3.9.10",
@@ -133,7 +133,7 @@ dataflow = [
 # GPU custom kernel dependency.
 gpu = [
     "triton>=2.1.0",
-    "jax[cuda12]== 0.8.1.dev20251107",
+    "jax[cuda12]==0.8.0",
     "nvidia-ml-py==12.560.30",
     # pin nccl version, otherwise jax[cuda12] will pull latest version
     "nvidia-nccl-cu12==2.27.5",
