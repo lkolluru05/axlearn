@@ -89,7 +89,7 @@ class GCSFuseMount(VolumeMount):
 
     gcs_path: str
     name: str = "gcs-fuse-csi-ephemeral"
-    mount_path: str = "/output"
+    mount_path: str = "/tmp/tensorflow_datasets"
     cpu: str = "250m"
     memory: str = "256Mi"
     ephemeral_gb: str = "5Gi"
