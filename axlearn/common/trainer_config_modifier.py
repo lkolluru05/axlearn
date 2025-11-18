@@ -5,7 +5,10 @@
 import json
 import logging
 import os
+import jax.numpy as jnp
 from typing import Callable, Dict, Optional, Sequence, Union
+import jax
+import jax.experimental.colocated_python as colocated_python
 
 from axlearn.common import config
 from axlearn.common import file_system as fs
@@ -328,6 +331,19 @@ class FP8ConfigModifier(ConfigModifier):
         cfg.learner.optimizer = update_cfg
         return cfg
 
+# @colocated_python.colocated_python
+# def transpose_array():
+    
+#     devices = jax.devices()
+#     cpu_devices = colocated_python.colocated_cpu_devices(devices)
+#     print(cpu_devices)
+#     #print(x)
+#     cpu_mesh = jax.sharding.Mesh(cpu_devices, ["x"])
+#     cpu_sharding = jax.sharding.NamedSharding(cpu_mesh, jax.P())
+#     x = jax.device_put(1, cpu_sharding)
+#     y = jax.jit(lambda x: x + 1)(x)
+#     print(y)
+    
 
 class GrainConfigModifier(ConfigModifier):
     """Converts tf.data input pipelines to grain input pipelines."""
@@ -449,6 +465,20 @@ class GrainConfigModifier(ConfigModifier):
             grain_input_config.input_partitioner = input_config.input_partitioner
 
         return grain_input_config
+    
+@colocated_python.colocated_python
+def create_source_array(num_elements_arr: jax.Array) -> jax.Array:
+
+    """Creates a numpy array and puts it into host memory."""
+    print("Creating a NumPy array...")
+    num_elements = int(num_elements_arr)
+    dtype = np.int32
+    host_array = np.arange(num_elements, dtype=dtype)
+    target_cpu_device = num_elements_arr.device
+    host_device_array = jax.device_put(host_array, target_cpu_device)
+    host_device_array.block_until_ready()
+    return host_device_array
+
 
     def __call__(self, cfg: SpmdTrainer.Config) -> SpmdTrainer.Config:
         """Converts tf.data input pipelines to grain input pipelines.
@@ -459,6 +489,65 @@ class GrainConfigModifier(ConfigModifier):
         Returns:
             The modified trainer config with grain input pipelines.
         """
+
+        import jax.sharding
+        import numpy as np
+        from jax.sharding import PartitionSpec as P
+
+        # --- 1. Define global parameters ---
+        data_bytes_per_device = 1 * 1024 * 1024 * 1024
+        dtype = np.float32
+        num_elements = data_bytes_per_device // np.dtype(dtype).itemsize
+
+        devices = jax.local_devices()
+        cpu_devices = colocated_python.colocated_cpu_devices(devices)
+
+        # --- 2. Define the @colocated_python function (Keep this untouched) ---
+
+        # --- 3. Specialize the function for the SINGLE-DEVICE call ---
+
+        # The loop iterates over single CPU devices, so specialization must be for ONE device.
+        # We take the first device to create the prototype mesh.
+        if not cpu_devices:
+            raise RuntimeError("No colocated CPU devices found to create prototype mesh.")
+            
+        single_device = cpu_devices[0]
+
+        # Single-device mesh (using a tuple here to match expectations, though it's just one device)
+        single_device_mesh = jax.sharding.Mesh((single_device,), ("single",))
+        replicated_sharding_single = jax.sharding.NamedSharding(single_device_mesh, P())
+
+        # Input Spec: Scalar int32, replicated on a single device
+        input_spec = jax.ShapeDtypeStruct(
+            shape=(), dtype=jnp.int32, sharding=replicated_sharding_single
+        )
+
+        # Output Spec: 1D array of size num_elements, float32, replicated on a single device
+        def output_spec_fn(unused_input_struct):
+            return jax.ShapeDtypeStruct(
+                shape=(num_elements,), dtype=jnp.int32, sharding=replicated_sharding_single
+            )
+
+        # Apply the explicit specialization
+        create_source_array_specialized = create_source_array.specialize(
+            in_specs=((input_spec,), {}),
+            out_specs_fn=output_spec_fn
+        )
+
+        # --- 4. Run the loop using the specialized function ---
+        host_arrays = []
+        for cpu_device in cpu_devices:
+            # 1. Create the input array (scalar int32) on the current device
+            num_elements_arr = jax.device_put(
+                np.array(num_elements, dtype=np.int32), cpu_device
+            )
+            
+            # 2. Call the specialized function
+            host_arrays.append(create_source_array_specialized(num_elements_arr))
+                
+
+        logging.info(host_arrays)
+
         # Convert training input if requested
         if self._convert_training_input and hasattr(cfg, "input"):
             cfg.input = self._convert_input_to_grain(cfg.input)

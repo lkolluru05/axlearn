@@ -49,15 +49,15 @@ _PATHWAYS_WORKER_PORT = 29001
 # There is no guarantee that this image will work with newer Jax releases.
 # This image version extends GRPC timeout for long context models, based on jax-0.5.3-patch060625
 # This image extends GRPC timeout for long context models.
-_PATHWAYS_IMAGE_TAG = "shm_proxy_settings"
-# The docker image used by pathways proxy container.
-_PATHWAYS_PROXY_IMAGE = (
-    f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
-)
-# The docker image used by pathways resource manager container and worker container.
-_PATHWAYS_SERVER_IMAGE = (
-    f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
-)
+# _PATHWAYS_IMAGE_TAG = "shm_proxy_settings"
+# # The docker image used by pathways proxy container.
+# _PATHWAYS_PROXY_IMAGE = (
+#     f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
+# )
+# # The docker image used by pathways resource manager container and worker container.
+# _PATHWAYS_SERVER_IMAGE = (
+#     f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
+# )
 # The container name of pathways resourcemanager.
 _PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME = "pathways-rm"
 # The container name of pathways proxy.
@@ -74,6 +74,27 @@ _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE = "workload"
 # Note that the head pod will back of exact this many times.
 # While workers will share #workers * _PATHWAYS_BACK_OFF_LIMIT total times.
 _PATHWAYS_BACK_OFF_LIMIT = 32
+
+_COLOCATED_CONTAINER_PORT = 50051
+_COLOCATED_PYTHON_SIDECAR_NAME = "colocated-python-sidecar"
+
+_PATHWAYS_COLOCATED_IMAGE_TAG = "2025-10-29"
+# The docker image used by pathways proxy container.
+_PATHWAYS_PROXY_IMAGE = (
+    "us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/proxy_server:"
+    f"{_PATHWAYS_COLOCATED_IMAGE_TAG}-increased-grpc-timeout"
+)
+# The docker image used by pathways resource manager container and worker container.
+_PATHWAYS_SERVER_IMAGE = (
+    "us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/server:"
+    f"{_PATHWAYS_COLOCATED_IMAGE_TAG}"
+)
+
+# The docker image used by pathways resource manager container and worker container.
+_COLOCATED_IMAGE = (
+    "us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/server:"
+    f"{_PATHWAYS_COLOCATED_IMAGE_TAG}"
+)
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
@@ -351,6 +372,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
             f"--gcs_scratch_location={staging_location}",
+            "--sidecar_name=external",
         ]
         cmd_args.extend(xla_flags_from_options(self._xla_options).split())
 
@@ -572,6 +594,25 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
         return worker_container
 
+
+    def _colocated_python_container(self):
+        cfg: PathwaysReplicatedJob.Config = self.config
+        #cmd_args = ["/bin/sleep", "infinity"]
+        return dict(
+            name=_COLOCATED_PYTHON_SIDECAR_NAME,
+            image="us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated:pygraincolocated", #self._bundler.id(cfg.name),
+            restartPolicy="Always",
+            env=[
+                {
+                    "name": "GRPC_SERVER_ADDRESS",
+                    "value": f"0.0.0.0:{_COLOCATED_CONTAINER_PORT}",
+                },
+            ],
+            imagePullPolicy="Always",
+            #args=cmd_args,
+            ports=[dict(containerPort=_COLOCATED_CONTAINER_PORT)],
+        )
+
     def _build_pathways_worker_pod(
         self, pathways_worker_replicated_job_index: Optional[int] = None
     ) -> Nested[Any]:
@@ -589,6 +630,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pod_spec["hostNetwork"] = True
         # Only set dnsPolicy if it's not already set
         pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
+        pod_spec["initContainers"] = [self._colocated_python_container()]
         pod_spec["containers"] = [
             self._build_pathways_worker_container(pathways_worker_replicated_job_index)
         ]

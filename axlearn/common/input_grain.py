@@ -877,6 +877,7 @@ def mixture_train_input_source(
         mixed_ds = sample_from_datasets(sources=sources, weights=weights)
 
         # Shard the mixed dataset
-        return mixed_ds.batch(4)
+        gbs=len(jax.devices())
+        return mixed_ds.batch(gbs)
 
     return build_dataset_fn
