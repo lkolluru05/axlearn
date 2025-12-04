@@ -45,7 +45,7 @@ from absl import logging
 from array_record.python.array_record_data_source import PathLikeOrFileInstruction
 from grain._src.python.data_loader import _determine_worker_count
 from grain._src.python.dataset import dataset as dataset_base
-from jax.experimental import multihost_utils
+from jax.experimental import multihost_utils, colocated_python
 
 from axlearn.common import file_system as fs
 from axlearn.common import input_base, utils
@@ -768,7 +768,6 @@ class Input(input_base.Input):
 
         return jax.tree.map(shape_dtype, example)
 
-
 def mixture_train_input_source(
     *,
     is_training: bool,
@@ -881,3 +880,152 @@ def mixture_train_input_source(
         return mixed_ds.batch(gbs)
 
     return build_dataset_fn
+
+
+# from jax.experimental import colocated_python
+# from axlearn.common import utils
+# from collections.abc import Iterator, Iterable
+
+# def _colocated_cpu_devices(
+#     devices: Sequence[jax.Device],
+# ) -> Sequence[jax.Device]:
+#   """Returns CPU devices colocated with the given devices."""
+#   return colocated_python.colocated_cpu_devices(devices)
+
+
+# def _colocated_cpu_mesh(mesh: Mesh) -> Mesh:
+#   """Returns a CPU mesh that has colocated CPU devices."""
+#   return colocated_python.colocated_cpu_devices(mesh)
+
+# @colocated_python.colocated_python
+# def _get_next(dummy_array):
+
+#     """get next batch from the iterator stored in the state of colocated python"""
+
+#     logging.info("In _get_next colocated python")
+
+#     if "iterator" not in colocated_python.__dict__:
+#         raise ValueError("iterator not found in colocated_python.__dict__")
+#     if "global_shape" not in colocated_python.__dict__:
+#         raise ValueError("_global_shape not found in colocated_python.__dict__")
+#     local_data = next(colocated_python.__dict__["iterator"])
+#     global_shape = colocated_python.__dict__["global_shape"]
+#     for k, v in local_data.items():
+#         local_data[k] = jnp.asarray(v)
+
+#     def form_global_array_colocated_python(path, array, devices, global_shape, sharding):
+#         try:
+#             device_arrays = np.split(array, len(devices), axis=0)
+#         except ValueError as array_split_error:
+#             raise ValueError(
+#                     f"Unable to put to devices shape {array.shape} with "
+#                     f"local device count {len(devices)} "
+#                     f"at {jtu.keystr(path)}"
+#             ) from array_split_error
+#         device_arrays = jax.device_put(device_arrays, devices)
+#         return jax.make_array_from_single_device_arrays(shape=global_shape, sharding=sharding, arrays=device_arrays)
+
+#     return jtu.tree_map_with_path(
+#         partial(
+#             form_global_array_colocated_python,
+#             devices=list(dummy_array.sharding.addressable_devices),
+#             global_shape=global_shape,
+#             sharding=dummy_array.sharding,
+#         ),
+#         local_data,
+#     )
+
+# def dataset(self):
+#     if "input_dispatcher" in self.children:
+#         # TODO(markblee): Generalize to support ndim>1.
+#         read_config = self.input_dispatcher.feed_read_config()
+#     else:
+#         read_config = dict(shard_index=[jax.process_index()], num_shards=[jax.process_count()])
+#     return maybe_to_iter_dataset(self._source(DispatchConfig(**read_config)))
+
+# class RemoteInput(input_base.Input):
+#     """A Module to generate input batches with `grain`."""
+
+#     @config_class
+#     class Config(input_base.Input.Config):
+#         """Configures Input.
+
+#         Attributes:
+#             source: A BuildDatasetFn (or a config instantiating to one). The result dataset will
+#                 contain a stream of examples representing one epoch of the source dataset.
+#         """
+
+#         source: Required[ConfigOr[BuildDatasetFn]] = REQUIRED
+
+#     @property
+#     def source(self) -> BuildDatasetFn:
+#         return self._source
+
+#     def __init__(self, cfg: Config, *, parent: Optional[Module]):
+#         super().__init__(cfg, parent=parent)
+#         cfg: RemoteInput.Config = self.config
+#         self._source = maybe_instantiate(cfg.source)
+#         self.cpu_devices = _colocated_cpu_devices(jax.local_devices())
+#         global_mesh = thread_resources.env.physical_mesh
+#         self.cpu_mesh = _colocated_cpu_mesh(global_mesh)
+#         self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, PartitionSpec(self.cpu_mesh.axis_names))
+#         self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+#         self.dummy_array = jax.device_put(self.dummy_array, self.cpu_sharding)
+
+#         if "input_dispatcher" in self.children:
+#             # TODO(markblee): Generalize to support ndim>1.
+#             read_config = self.input_dispatcher.feed_read_config()
+#         else:
+#             read_config = dict(shard_index=[jax.process_index()], num_shards=[jax.process_count()])
+    
+#         @colocated_python.colocated_python
+#         def init(dummy_array):
+#             logging.info("In init colocated python")
+#             colocated_python.global_shape = utils.input_partition_spec()
+#             dataloader = dataset()
+#             if isinstance(dataloader, tf.data.Dataset):
+#                 colocated_python.iterator = dataloader.as_numpy_iterator()
+#             elif isinstance(dataloader, Iterable):
+#                 colocated_python.iterator = iter(dataloader)
+#             else:
+#                 raise ValueError("Type error: dataloader should be either tf.data.Dataset or grain.DataLoader.")
+#             return dummy_array
+
+#         out = jax.device_get(init(self.dummy_array))
+#         if out is not None:
+#             logging.info(f"RemoteIterator initiated. Test output: {out}")
+
+    
+#     def __next__(self):
+#         out = _get_next(self.dummy_array)
+
+#         def put_to_tpu_devices(path, array, sharding):
+#             try:
+#                 return jax.device_put(array, sharding)
+#             except Exception as e:  # pylint: disable=broad-exception-caught
+#                 max_logging.log(f"Error putting data to TPU device path{path}, exception={e}")
+#                 raise
+
+#         input_gdas = jtu.tree_map_with_path(partial(put_to_tpu_devices, sharding=self.tpu_sharding), out)
+
+#         return input_gdas
+
+
+#     def element_spec(self) -> utils.Nested[jax.ShapeDtypeStruct]:
+#         """Infers the element spec.
+
+#         Grain requires fetching an example from the dataset to extract the spec. To avoid reading
+#         actual data, replace your source dataset with one from `input_fake.fake_grain_source`.
+#         """
+#         ds = self.dataset()
+#         if isinstance(ds, grain.MapDataset):
+#             example = ds[0]
+#         else:
+#             example = next(ds.__iter__())  # pylint: disable=unnecessary-dunder-call
+
+#         def shape_dtype(x):
+#             if not hasattr(x, "shape") or not hasattr(x, "dtype"):
+#                 raise ValueError(f"element_spec() requires Tensor-like leaves, got: {x}.")
+#             return jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
+
+#         return jax.tree.map(shape_dtype, example)

@@ -45,6 +45,7 @@ from axlearn.common.trainer_config_modifier import (
     FP8ConfigModifier,
     GradientAccumulationModifier,
     GrainConfigModifier,
+    RemoteGrainConfigModifier,
     MeshShapeModifier,
     ModuleConfigModifier,
     PartitionSpecModifier,
@@ -449,7 +450,7 @@ def get_trainer_kwargs(
                     ChainConfigModifier.default_config().set(
                         config_modifiers=[
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=32)
+                                mesh_shape=mesh_shape_from_axes(data=1, fsdp=-1)
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
@@ -1136,7 +1137,7 @@ def trainer_configs(
                 # pytype: enable=annotation-type-mismatch
 
                 # Apply grain config modifier to convert tf.data to Grain
-                grain_modifier = GrainConfigModifier.default_config().set(
+                grain_modifier = RemoteGrainConfigModifier.default_config().set(
                     convert_training_input=True,
                 )
                 cfg = grain_modifier.instantiate()(cfg)
@@ -1146,6 +1147,9 @@ def trainer_configs(
             logging.info("In fuji, 7B , Pygrain implementation")
             make_grain_config_func = functools.partial(make_grain_config, config_name)
             config_map[f"{config_name}-grain"] = make_grain_config_func
+
+            logging.info("config_map")
+            logging.info(config_map)
 
             # Make grain configs for FP8
             if f"{config_name}-fp8" in config_map:

@@ -333,42 +333,27 @@ class FP8ConfigModifier(ConfigModifier):
         cfg.learner.optimizer = update_cfg
         return cfg
 
-@colocated_python.colocated_python
-def create_source_array(num_elements_arr: jax.Array) -> jax.Array:
-
-    """Creates a numpy array and puts it into host memory."""
-    print("Creating a NumPy array,print...")
-    logging.info("Creating a NumPy array,log...")
-    sys.stderr.write("Creating a NumPy array, std...")
-    num_elements = int(num_elements_arr)
-    dtype = np.int32
-    host_array = np.arange(num_elements, dtype=dtype)
-    target_cpu_device = num_elements_arr.device
-    host_device_array = jax.device_put(host_array, target_cpu_device)
-    host_device_array.block_until_ready()
-    logging.info("Created a NumPy array...")
-    return host_device_array
-
-@colocated_python.colocated_python
-def f(x):
-    print("In colocated print")
-    print(f"[Colocated] x: {x} on device: {x.device}")
-    logging.info("In colocated log")
-    return x + 1
 
 def run_add_one_test(cpu_devices):
     """Tests a simple colocated function that adds one to an input."""
-    print("--- Running Add One Test ---")
+    logging.info("--- Running Add One Test ---")
+    logging.info("Process count in lktest: %s",str(jax.process_count()))
+    logging.info("Process index in lktest: %s",str(jax.process_index()))
 
     @colocated_python.colocated_python
     def add_one(input_x):
         """Colocated Python function that adds one to the input."""
         print(f"[Colocated] x: {input_x} on device: {input_x.device}")
+        logging.info("lkolluru test code")
+        logging.info("value: %s",str(input_x))
+        logging.info("value: %s",str(input_x+1))
+        logging.info("Process count in colocated: %s",str(jax.process_count()))
+        logging.info("Process index in colocated: %s",str(jax.process_index()))
         return input_x + 1
 
     # First call
     x = jax.device_put(np.array(1), cpu_devices[0])
-    print(f"Adding one to input {x}")
+    logging.info("Adding one to input")
 
     single_device = cpu_devices[0]
 
@@ -404,25 +389,13 @@ def run_add_one_test(cpu_devices):
         # ),
         out_specs_fn=output_spec_fn 
         )
-
+    logging.info("First call before CP.")
     out = add_one_specialized(x)
     out.block_until_ready()
-    print(f"output of add_one(x): {out}")
     assert np.array_equal(np.array(out), x + 1)
     assert out.device == x.device
-    print("✅ First call verified.")
+    logging.info("First call verified after CP.")
 
-    # Second call
-    y = jax.device_put(np.array(5), cpu_devices[0])
-    print(f"Adding one to input {y}")
-    out = add_one_specialized(y)
-    out.block_until_ready()
-    print(f"output of add_one(y): {out}")
-    assert np.array_equal(np.array(out), np.array(6))
-    assert out.device == cpu_devices[0]
-    print("✅ Second call verified.")
-
-    print("\n🎉 All add_one() assertions passed successfully! 🎉\n")
     
 
 class GrainConfigModifier(ConfigModifier):
@@ -450,15 +423,6 @@ class GrainConfigModifier(ConfigModifier):
         self._convert_training_input = cfg.convert_training_input
         self._grain_source_builder = cfg.grain_source_builder
 
-        #### Colocated code test ######
-        import jax.sharding
-        import numpy as np
-        from jax.sharding import PartitionSpec as P
-        devices = jax.devices()
-        cpu_devices = colocated_python.colocated_cpu_devices(devices)
-        run_add_one_test(cpu_devices)
-        
-
 
     def _convert_tf_data_to_grain_source(
         self, tf_data_config: ConfigOr[Configurable]
@@ -471,6 +435,18 @@ class GrainConfigModifier(ConfigModifier):
         Returns:
             A grain source configuration.
         """
+        logging.info("In _convert_tf_data_to_grain_source")
+        #### Colocated code test ######
+        import jax.sharding
+        import numpy as np
+        from jax.sharding import PartitionSpec as P
+        devices = jax.devices()
+        
+        cpu_devices = colocated_python.colocated_cpu_devices(devices)
+        
+        run_add_one_test(cpu_devices)
+
+
         # Import grain modules here to avoid circular imports
         from axlearn.common import input_grain, input_grain_lm
         import grain.python as grain
@@ -572,3 +548,231 @@ class GrainConfigModifier(ConfigModifier):
         logging.info("GrainConfigModifier call")
         logging.info(cfg)
         return cfg
+
+
+from axlearn.common import utils
+from jax._src.mesh import thread_resources
+import functools
+
+
+class RemoteGrainConfigModifier(ConfigModifier):
+    """Converts tf.data input pipelines to grain input pipelines."""
+
+    @config_class
+    class Config(ConfigModifier.Config):
+        """Configure RemoteGrainConfigModifier.
+
+        TODO: Supports evaluation pipeline using grain.
+
+        Attributes:
+            convert_training_input: Whether to convert the training input pipeline to grain.
+            grain_source_builder: Optional grain source builder function to use.
+                If None, attempts to automatically convert from tf.data sources.
+        """
+
+        convert_training_input: bool = True
+        grain_source_builder: Optional[ConfigOr[Configurable]] = None
+
+
+    def __init__(self, cfg: Config,):
+        super().__init__(cfg)
+        cfg = self.config
+        self._convert_training_input = cfg.convert_training_input
+        self._grain_source_builder = cfg.grain_source_builder
+        self.tpu_devices = jax.devices()
+        self.cpu_devices = colocated_python.colocated_cpu_devices(self.tpu_devices)
+        self.cpu_mesh = jax.sharding.Mesh(self.cpu_devices, ["x"])
+        self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, jax.sharding.PartitionSpec())
+        self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+        self.dummy_array = jax.device_put(self.dummy_array, self.cpu_sharding)
+
+    def _convert_tf_data_to_grain_source(
+        self, tf_data_config: ConfigOr[Configurable]
+    ) -> ConfigOr[Configurable]:
+        """Converts a tf.data source config to a grain source config.
+
+        Args:
+            tf_data_config: The tf.data source configuration.
+
+        Returns:
+            A grain source configuration.
+        """
+        # Import grain modules here to avoid circular imports
+        from axlearn.common import input_grain, input_grain_lm
+        import grain.python as grain
+
+        # Extract data mixture components from tf_data_config
+        components = tf_data_config.data_mixture_components
+        # Extract other relevant config parameters from tf_data_config, with fallbacks
+        vocab_cfg = tf_data_config.vocab_cfg
+        max_sequence_length = tf_data_config.max_sequence_length
+        
+        def partial_text_to_lm_training_input(
+            vocab: ConfigOr[input_grain_text.Vocabulary],
+            max_len: int,
+            window_size: int = 128,
+            max_padding_fraction: float = 1,
+            read_options: grain.ReadOptions = grain.ReadOptions(
+                num_threads=1, prefetch_buffer_size=16
+            ),
+            packing_fn: Callable = windowed_packing,
+        ) -> Callable[[Dataset], Dataset]:
+            return lambda ds: input_grain_lm.text_to_lm_training_input(
+                ds,
+                vocab=vocab,
+                max_len=max_len,
+                max_padding_fraction=max_padding_fraction,
+                window_size=window_size,
+                read_options=read_options,
+                packing_fn=packing_fn,
+            )
+
+        preprocessor = config_for_function(partial_text_to_lm_training_input).set(
+            vocab=vocab_cfg,
+            max_len=max_sequence_length,
+            max_padding_fraction=tf_data_config.preprocessor.max_padding_fraction,
+            window_size=tf_data_config.preprocessor.window_size,
+            read_options=grain.ReadOptions(num_threads=2, prefetch_buffer_size=16),
+        )
+        max_sequence_length = tf_data_config.max_sequence_length
+        replace_newlines_with = tf_data_config.replace_newlines_with
+
+        # Use the existing mixture_train_input_source function which already handles
+        # GCS path conversion and fs.listdir operations
+        preprocessing_fn = functools.partial(
+          input_grain.mixture_train_input_source,
+            is_training=True,
+            vocab_cfg=vocab_cfg,
+            preprocessor=preprocessor,
+            data_mixture_components=components,
+            max_sequence_length=max_sequence_length,
+            replace_newlines_with=replace_newlines_with,
+            seed=42,
+        )
+
+        # @colocated_python.colocated_python
+        # def init(dummy_array):
+        #     logging.info("In init colocated python")
+        #     dataset = preprocessing_fn()
+        #     logging.info("dataset : %s",type(dataset))
+        #     logging.info(dataset)
+        #     return dummy_array
+        
+        @colocated_python.colocated_python
+        def add_one(input_x):
+            """Colocated Python function that adds one to the input."""
+            print(f"[Colocated] x: {input_x} on device: {input_x.device}")
+            logging.info("lkolluru test code")
+            logging.info("value: %s",str(input_x))
+            logging.info("value: %s",str(input_x+1))
+            dataset = preprocessing_fn()
+            colocated_python.ds=dataset
+            logging.info("dataset : %s",type(dataset))
+            logging.info(dataset)
+            logging.info("Process count in colocated: %s",str(jax.process_count()))
+            logging.info("Process index in colocated: %s",str(jax.process_index()))
+            return input_x + 1
+
+        # First call
+        x = jax.device_put(np.array(1), self.cpu_devices[0])
+        logging.info("Adding one to input")
+
+        single_device = self.cpu_devices[0]
+
+        # Single-device Mesh and Sharding (required for specialization)
+        single_device_mesh = jax.sharding.Mesh((single_device,), ("single",))
+        # P() represents full replication for the array (a scalar in this case)
+        replicated_sharding_single = jax.sharding.NamedSharding(single_device_mesh, jax.sharding.PartitionSpec())
+
+        INPUT_DTYPE = jnp.dtype(np.array(1).dtype) 
+        SCALAR_SHAPE = ()
+
+        # Input Spec: Scalar int32, replicated on a single device
+        input_spec = jax.ShapeDtypeStruct(
+            shape=SCALAR_SHAPE, 
+            dtype=INPUT_DTYPE, 
+            sharding=replicated_sharding_single
+        )
+
+        # Output Spec Function: Returns an array with the same shape/dtype/sharding as the input
+        def output_spec_fn(input_struct):
+            return jax.ShapeDtypeStruct(
+                shape=input_struct.shape, 
+                dtype=input_struct.dtype, 
+                sharding=input_struct.sharding
+        )
+
+        add_one_specialized = add_one.specialize(
+            out_specs_fn=output_spec_fn 
+        )
+        logging.info("First call before CP.")
+        out = add_one_specialized(x)
+        out.block_until_ready()
+        
+        # Use the existing mixture_train_input_source function which already handles
+        # GCS path conversion and fs.listdir operations
+        return input_grain.mixture_train_input_source(
+            is_training=True,
+            vocab_cfg=vocab_cfg,
+            preprocessor=preprocessor,
+            data_mixture_components=components,
+            max_sequence_length=max_sequence_length,
+            replace_newlines_with=replace_newlines_with,
+            seed=42,
+        )
+
+    
+    def _convert_input_to_grain(self, input_config: Configurable.Config) -> Configurable.Config:
+        """Converts a tf.data Input config to a grain Input config.
+
+        Args:
+            input_config: The tf.data Input configuration.
+
+        Returns:
+            A grain Input configuration.
+        """
+        # Import grain input module
+        from axlearn.common import input_grain
+
+        # Create new grain input config
+        grain_input_config = input_grain.Input.default_config()
+
+        # Convert the source
+        if self._grain_source_builder is not None:
+            grain_input_config.source = self._grain_source_builder
+        else:
+            assert hasattr(input_config, "source")
+            # Attempt automatic conversion
+            grain_input_config.source = self._convert_tf_data_to_grain_source(
+                input_config.source,
+                #global_logical_batch_size=input_config.input_dispatcher.global_logical_batch_size,
+            )
+
+        # Copies input_dispatcher and input_partitioner.
+        if hasattr(input_config, "input_dispatcher"):
+            grain_input_config.input_dispatcher = input_config.input_dispatcher
+        if hasattr(input_config, "input_partitioner"):
+            grain_input_config.input_partitioner = input_config.input_partitioner
+
+        return grain_input_config
+    
+    def __call__(self, cfg: SpmdTrainer.Config) -> SpmdTrainer.Config:
+        """Converts tf.data input pipelines to grain input pipelines.
+
+        Args:
+            cfg: The trainer config to be modified.
+
+        Returns:
+            The modified trainer config with grain input pipelines.
+        """
+        # Convert training input if requested
+        if self._convert_training_input and hasattr(cfg, "input"):
+            cfg.input = self._convert_input_to_grain(cfg.input)
+        logging.info("Remote GrainConfigModifier call")
+        logging.info(cfg)
+        return cfg
+
+
+
+
+
