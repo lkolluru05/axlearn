@@ -62,6 +62,9 @@ from axlearn.common.utils import (
     match_regex_rules,
     thread_stack_traces,
 )
+from axlearn.common.input_grain import RemoteInputAnnotate
+import jax.experimental.colocated_python as colocated_python
+from jax.experimental import mesh_utils
 
 
 class TrainerState(NamedTuple):
@@ -300,6 +303,8 @@ class SpmdTrainer(Module):
 
         # Create all children within the mesh context so that utils.input_partition_spec() works
         # properly.
+        
+        
         with self.mesh():
             if cfg.batch_axis_names is not None:
                 cfg.input = maybe_set_config(
@@ -308,8 +313,19 @@ class SpmdTrainer(Module):
             self.input: Input = self._add_child(
                 "input", maybe_set_config(cfg.input, is_training=True)
             )
-            # Start from the beginning of the input dataset by default.
+
+            
+            self.cpu_devices = colocated_python.colocated_cpu_devices(jax.local_devices())
+            self.tpu_devices = jax.local_devices()
+            self.cpu_mesh = colocated_python.colocated_cpu_devices(mesh)
+            self.tpu_sharding = jax.sharding.NamedSharding(mesh, PartitionSpec(mesh.axis_names))
+            self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, PartitionSpec(self.cpu_mesh.axis_names))
+            self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+            self.x = jax.device_put(self.dummy_array, self.cpu_sharding)
+            
+
             self._input_iter = iter(self.input.dataset())
+            logging.info("in Trainer input_iter : %s",str(self._input_iter))
             cfg.summary_writer.dir = cfg.summary_writer.dir or os.path.join(
                 cfg.dir, "summaries", "train_train"
             )
@@ -601,11 +617,22 @@ class SpmdTrainer(Module):
                 output = None
                 stop_trace_step = None
 
-                input_iterator = self.input.batches(self._input_iter)
+                
+                partition_spec = self._train_step_input_partition_specs()
+                logging.info("Partition spec in trainer: %s", str(partition_spec))
+                self.remoteiterator = RemoteInputAnnotate(cfg,partition_spec)
+                out = self.remoteiterator.init_check(self.x)
+                self.remote_iter = self.remoteiterator.dataset(self.x)
+                
+
+                #input_iterator = self.input.batches(self._input_iter)
+                
                 while True:
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
-                        input_batch = next(input_iterator)
+                        #input_batch = next(input_iterator)
+                        input_batch = self.remoteiterator.get_next(self.x)
+                        #logging.info("input_batch: %s", str(input_batch)) ### gives out arrays ####
                         self._maybe_record_event(measurement.Event.END_DATA_LOADING)
                         logging.log_first_n(
                             logging.INFO, "host_input_batch=%s", 3, utils.shapes(input_batch)
@@ -617,11 +644,13 @@ class SpmdTrainer(Module):
                         self._step = self._step + 1
                         self.vlog(3, "Start step %s", self.step)
                         self._maybe_record_event(measurement.Event.START_STEP, self._step)
+                        
                         output = self._run_step(
-                            utils.host_to_global_array(
-                                input_batch,
-                                partition=self._train_step_input_partition_specs(),
-                            ),
+                            # utils.host_to_global_array(
+                            #     input_batch,
+                            #     partition=self._train_step_input_partition_specs(),
+                            # ),
+                            input_batch,
                             force_run_evals=(
                                 force_run_eval_sets_at_max_step
                                 if self.step >= cfg.max_step
@@ -630,7 +659,7 @@ class SpmdTrainer(Module):
                         )
                         self.vlog(3, "Done step %s", self.step)
                         num_steps += 1
-                        if num_steps % 1 == 0:
+                        if num_steps % 100 == 0:
                             now = time.perf_counter()
                             average_step_time = (now - start_time) / num_steps
                             self._step_log("Average step time: %s seconds", average_step_time)
@@ -1344,7 +1373,6 @@ class SpmdTrainer(Module):
                 cfg.start_trace_process_indices == "all"
                 or jax.process_index() in cfg.start_trace_process_indices
             )
-            self._step_log(f"{should_start_tracing=}")
         if should_start_tracing:
             self._step_log("Start profiler tracing")
             jax.profiler.start_trace(self.summary_writer.config.dir)

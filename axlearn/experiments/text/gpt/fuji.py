@@ -14,6 +14,7 @@ import enum
 import functools
 import itertools
 from typing import Any, List, NamedTuple, Optional, Union
+from absl import logging
 
 from jax.ad_checkpoint import checkpoint_policies as jax_remat_policies
 
@@ -32,7 +33,7 @@ from axlearn.common.attention import (
     StackedTransformerLayer,
 )
 from axlearn.common.base_layer import RematSpec
-from axlearn.common.config import TrainerConfigFn, config_for_function, with_overrides
+from axlearn.common.config import config_for_function
 from axlearn.common.decoder import LmHead
 from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.flash_attention.layer import FlashBlockSizeModifier
@@ -43,6 +44,8 @@ from axlearn.common.trainer_config_modifier import (
     ChainConfigModifier,
     FP8ConfigModifier,
     GradientAccumulationModifier,
+    GrainConfigModifier,
+    RemoteGrainConfigModifier,
     MeshShapeModifier,
     ModuleConfigModifier,
     PartitionSpecModifier,
@@ -65,13 +68,9 @@ from axlearn.experiments.text.gpt.common import (
 )
 from axlearn.experiments.text.gpt.common import model_config as common_model_config
 from axlearn.experiments.text.gpt.common import scaled_hidden_dim
-from axlearn.experiments.trainer_config_utils import (
-    SplashAttentionConfigModifier,
-    V6eFlashConfigModifier,
-    V7xFlashConfigModifier,
-)
+from axlearn.experiments.trainer_config_utils import TrainerConfigFn, V6eFlashConfigModifier
 
-MODEL_SIZES = ("test", "1B", "3B", "7B", "8B", "70B", "405B")
+MODEL_SIZES = ("test", "1B", "3B", "7B", "8B", "70B")
 
 
 class Version(enum.Enum):
@@ -124,7 +123,6 @@ TOTAL_TOKENS = {
         "3B": 15 * (1024**4),  # 15T tokens
         "7B": 15 * (1024**4),  # 15T tokens
         "70B": 15 * (1024**4),  # 15T tokens
-        "405B": 15 * (1024**4),  # 15T tokens
     },
     Version.V3_TIKTOKEN: {
         "test": 15 * (1024**4),  # 15T tokens
@@ -132,35 +130,47 @@ TOTAL_TOKENS = {
         "3B": 15 * (1024**4),  # 15T tokens
         "8B": 15 * (1024**4),  # 15T tokens
         "70B": 15 * (1024**4),  # 15T tokens
-        "405B": 15 * (1024**4),  # 15T tokens
     },
 }
 
 
-def offload_dots_saveable_policy(prim, *args, **kwargs):
+def offload_dots_saveable_policy(*_, **__):
     """A rematerialization policy function used in RematSpec to offload dot_general_p
     operations from device to pinned host memory.
+
+    Args:
+        *_: Ignored positional arguments.
+        **__: Ignored keyword arguments.
+
+    Returns:
+        A policy function that offloads dot_general_p from device to pinned host
+    memory.
     """
-    return (
-        config_for_function(extended_checkpoint_policies.offload_dots_saveable)
-        .set(offload_src="device", offload_dst="pinned_host")
-        .instantiate()(prim, *args, **kwargs)
+    return config_for_function(extended_checkpoint_policies.offload_dots_saveable).set(
+        offload_src="device", offload_dst="pinned_host"
     )
 
 
-def offload_attention_proj_policy(prim, *args, **kwargs):
+def offload_attention_proj_policy(*_, **__):
     """A rematerialization policy function used in RematSpec to offload attention
     projection intermediates during model execution.
+
+    Args:
+        *_: Ignored positional arguments.
+        **__: Ignored keyword arguments.
+
+    Returns:
+        A checkpoint policy function that offloads native attention projection intermediates
+        from device to pinned host memory, enabling memory-efficient training with checkpoint
+        support.
     """
-    return (
-        config_for_function(extended_checkpoint_policies.save_and_offload_only_these_names_regex)
-        .set(
-            names_which_can_be_saved=None,
-            names_which_can_be_offloaded=RematRegexSavePatterns.NATIVE_ATTENTION.value,
-            offload_src="device",
-            offload_dst="pinned_host",
-        )
-        .instantiate()(prim, *args, **kwargs)
+    return config_for_function(
+        extended_checkpoint_policies.save_and_offload_only_these_names_regex
+    ).set(
+        names_which_can_be_saved=None,
+        names_which_can_be_offloaded=RematRegexSavePatterns.NATIVE_ATTENTION.value,
+        offload_src="device",
+        offload_dst="pinned_host",
     )
 
 
@@ -389,6 +399,7 @@ def get_trainer_kwargs(
             ),
         )
     elif model_size == "7B":
+        import jax
         trainer_kwargs = dict(
             model_kwargs=dict(
                 num_layers=32,
@@ -401,7 +412,7 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
+            train_batch_size=len(jax.devices()), #train_batch_size,
             max_step=max_step,
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
             mesh_rules=(
@@ -431,6 +442,36 @@ def get_trainer_kwargs(
                                 }
                             ),
                             GradientAccumulationModifier.default_config().set(grad_acc_steps=4),
+                        ],
+                    ),
+                ),
+                (
+                    "tpu-v5litepod-32",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=mesh_shape_from_axes(data=1, fsdp=-1),
+                            ),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=False,
+                                        policy=config_for_function(
+                                            save_and_offload_only_these_names_regex
+                                        ).set(
+                                            names_which_can_be_saved="|".join(
+                                                [
+                                                    RematRegexSavePatterns.FLASH_ATTENTION.value,
+                                                    ".*linear1_0",
+                                                ]
+                                            ),
+                                            names_which_can_be_offloaded=None,
+                                            offload_src="device",
+                                            offload_dst="pinned_host",
+                                        ),
+                                    ),
+                                }
+                            ),
                         ],
                     ),
                 ),
@@ -481,11 +522,31 @@ def get_trainer_kwargs(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
                                         prevent_cse=False,
-                                        policy=offload_attention_proj_policy,
+                                        policy=jax_remat_policies.dots_saveable,
                                     ),
                                 }
                             ),
                             V6eFlashConfigModifier.default_config(),
+                        ],
+                    ),
+                ),
+                (
+                    "tpu-v6e-256",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=256)
+                            ),
+                            # RematSpecModifier.default_config().set(
+                            #     remat_policies={
+                            #         "model.decoder.transformer.layer": RematSpec(
+                            #             prevent_cse=False,
+                            #             policy=offload_attention_proj_policy,
+                            #         ),
+                            #     }
+                            # ),
+                            V6eFlashConfigModifier.default_config(),
+                            #GradientAccumulationModifier.default_config().set(grad_acc_steps=4),
                         ],
                     ),
                 ),
@@ -656,6 +717,7 @@ def get_trainer_kwargs(
             ),
         )
     elif model_size == "70B":
+        import jax
         trainer_kwargs = dict(
             model_kwargs=dict(
                 num_layers=80,
@@ -671,7 +733,7 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
+            train_batch_size=len(jax.devices()), #train_batch_size,
             max_step=max_step,
             mesh_shape=mesh_shape_from_axes(fsdp=-1),
             mesh_rules=(
@@ -713,92 +775,11 @@ def get_trainer_kwargs(
                                         ).set(
                                             names_which_can_be_saved="|".join(
                                                 [
-                                                    RematRegexSavePatterns.QKV_PROJ.value
+                                                    RematRegexSavePatterns.FLASH_ATTENTION.value,
+                                                    ".*linear1_0",
                                                 ]
                                             ),
-                                            names_which_can_be_offloaded="|".join(
-                                                [
-                                                    RematRegexSavePatterns.INPUT.value,
-                                                ]
-                                            ),
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
-                                    ),
-                                }
-                            ),
-                        ],
-                    ),
-                ),
-                (
-                    "tpu-v7x-128",
-                    ChainConfigModifier.default_config().set(
-                        config_modifiers=[
-                            MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=128)
-                            ),
-                            # Ensure we set the default tpu_block_size=2048 on v7x
-                            # With the 70B model, MaxText also modifies block_q
-                            # and block_kv_compute to 4096 and 1024 respectively
-                            V7xFlashConfigModifier.default_config(),
-                            SplashAttentionConfigModifier.default_config().set(
-                                splash_block_q=4096,
-                                splash_block_kv_compute=1024,
-                            ),
-                            RematSpecModifier.default_config().set(
-                                remat_policies={
-                                    "model.decoder.transformer.layer": RematSpec(
-                                        prevent_cse=False,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved="|".join(
-                                                [
-                                                    RematRegexSavePatterns.QKV_PROJ.value
-                                                ]
-                                            ),
-                                            names_which_can_be_offloaded="|".join(
-                                                [
-                                                    RematRegexSavePatterns.INPUT.value,
-                                                ]
-                                            ),
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
-                                    ),
-                                }
-                            ),
-                        ],
-                    ),
-                ),
-                (
-                    "tpu-v7x-256",
-                    ChainConfigModifier.default_config().set(
-                        config_modifiers=[
-                            MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=128)
-                            ),
-                            # Ensure we set the default tpu_block_size=2048 on v7x
-                            # With the 70B model, MaxText also modifies block_q
-                            # and block_kv_compute to 4096 and 1024 respectively
-                            V7xFlashConfigModifier.default_config(),
-                            SplashAttentionConfigModifier.default_config().set(
-                                splash_block_q=4096,
-                                splash_block_kv_compute=1024,
-                            ),
-                            RematSpecModifier.default_config().set(
-                                remat_policies={
-                                    "model.decoder.transformer.layer": RematSpec(
-                                        prevent_cse=False,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved=None,
-                                            names_which_can_be_offloaded="|".join(
-                                                [
-                                                    RematRegexSavePatterns.INPUT.value,
-                                                ]
-                                            ),
+                                            names_which_can_be_offloaded=None,
                                             offload_src="device",
                                             offload_dst="pinned_host",
                                         ),
@@ -820,19 +801,7 @@ def get_trainer_kwargs(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
                                         prevent_cse=False,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved=None,
-                                            names_which_can_be_offloaded="|".join(
-                                                [
-                                                    RematRegexSavePatterns.QKV_PROJ.value,
-                                                    RematRegexSavePatterns.INPUT.value,
-                                                ]
-                                            ),
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
+                                        policy=offload_attention_proj_policy,
                                     ),
                                 }
                             ),
@@ -925,87 +894,6 @@ def get_trainer_kwargs(
                 ),
             ),
         )
-    elif model_size == "405B":
-        trainer_kwargs = dict(
-            model_kwargs=dict(
-                num_layers=126,
-                hidden_dim=16384,
-                ffn_dim=53248,
-                num_heads=128,
-                # No GQA support in V1 models, so num_kv_heads is the same as num_heads.
-                num_kv_heads=None if version == Version.V1 else 8,
-                rope_theta=rope_theta,
-                shared_lm_head=False,
-                flash_attention=flash_attention,
-            ),
-            learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
-            max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
-            max_step=max_step,
-            mesh_shape=mesh_shape_from_axes(fsdp=-1),
-            mesh_rules=(
-                (
-                    "tpu-v5p-.*",
-                    ChainConfigModifier.default_config().set(
-                        config_modifiers=[
-                            MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(fsdp=-1)
-                            ),
-                            RematSpecModifier.default_config().set(
-                                remat_policies={
-                                    "model.decoder.transformer.layer": RematSpec(
-                                        prevent_cse=False,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved=None,
-                                            names_which_can_be_offloaded="|".join(
-                                                [
-                                                    RematRegexSavePatterns.INPUT.value,
-                                                ]
-                                            ),
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
-                                    ),
-                                }
-                            ),
-                        ],
-                    ),
-                ),
-                (
-                    "tpu-v7x-.*",
-                    ChainConfigModifier.default_config().set(
-                        config_modifiers=[
-                            MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(fsdp=-1)
-                            ),
-                            # Use the updated block size for Splash Attention
-                            V7xFlashConfigModifier.default_config(),
-                            RematSpecModifier.default_config().set(
-                                remat_policies={
-                                    "model.decoder.transformer.layer": RematSpec(
-                                        prevent_cse=False,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved=None,
-                                            names_which_can_be_offloaded="|".join(
-                                                [
-                                                    RematRegexSavePatterns.INPUT.value,
-                                                ]
-                                            ),
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
-                                    ),
-                                }
-                            ),
-                        ],
-                    ),
-                ),
-            ),
-        )
     else:
         raise NotImplementedError(f"Unknown model size {model_size}.")
     model_kwargs = trainer_kwargs.pop("model_kwargs")
@@ -1076,9 +964,6 @@ def model_config(
         input_linear=atten_input_linear,
         rotary_value=False,
     )
-    # Shard the 'num_heads' axis by the 'model' dim of the mesh and
-    # 'model_dim' by the 'fsdp' dim of the mesh.
-    atten_qkv_linear.input_linear.layer.param_partition_spec = ("fsdp", "model", None)
     atten_qkv_linear.rope_pos_emb_layer.theta = rope_theta
     attention_kv_cache = KVCache.default_config().set(cache_dtype=STEP_DTYPE)
 
@@ -1251,5 +1136,46 @@ def trainer_configs(
                     make_single_host_config, f"{config_name}-fp8"
                 )
                 config_map[f"{config_name}-fp8-single-host"] = make_single_host_fp8_config_func
+
+        if model_size in ("7B"):
+
+            def make_grain_config(base_config_name: str) -> SpmdTrainer.Config:
+                """Make a grain input processor variant of the base config.
+
+                This configuration uses the grain input processing framework for
+                improved data loading and preprocessing performance.
+
+                Args:
+                    base_config_name: The base config name.
+
+                Returns:
+                    A trainer config that uses grain input processing.
+                """
+
+                # pytype: disable=annotation-type-mismatch
+                cfg: SpmdTrainer.Config = config_map[base_config_name]().clone()
+                # pytype: enable=annotation-type-mismatch
+
+                # Apply grain config modifier to convert tf.data to Grain
+                grain_modifier = GrainConfigModifier.default_config().set(
+                    convert_training_input=True,
+                )
+                cfg = grain_modifier.instantiate()(cfg)
+                return cfg
+
+            # Make grain config
+            logging.info("In fuji, 7B , Pygrain implementation")
+            make_grain_config_func = functools.partial(make_grain_config, config_name)
+            config_map[f"{config_name}-grain"] = make_grain_config_func
+
+            logging.info("config_map")
+            logging.info(config_map)
+
+            # Make grain configs for FP8
+            if f"{config_name}-fp8" in config_map:
+                make_grain_fp8_config_func = functools.partial(
+                    make_grain_config, f"{config_name}-fp8"
+                )
+                config_map[f"{config_name}-fp8-grain"] = make_grain_fp8_config_func
 
     return config_map
