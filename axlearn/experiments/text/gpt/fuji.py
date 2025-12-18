@@ -92,7 +92,7 @@ VOCAB_SIZE = {
 # Mapping from Fuji versions to maximum sequence lengths.
 MAX_SEQUENCE_LENGTH = {
     Version.V1: 2048,
-    Version.V2: 4096,
+    Version.V2: 2048,
     Version.V3: 8192,
     Version.V3_TIKTOKEN: 8192,
 }
@@ -400,6 +400,7 @@ def get_trainer_kwargs(
         )
     elif model_size == "7B":
         import jax
+        from jax import checkpoint_policies as jax_remat_policies1
         trainer_kwargs = dict(
             model_kwargs=dict(
                 num_layers=32,
@@ -412,7 +413,7 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=len(jax.devices()), #train_batch_size,
+            train_batch_size=len(jax.local_devices()), #train_batch_size,
             max_step=max_step,
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
             mesh_rules=(
@@ -537,14 +538,14 @@ def get_trainer_kwargs(
                             MeshShapeModifier.default_config().set(
                                 mesh_shape=mesh_shape_from_axes(data=-1, fsdp=256)
                             ),
-                            # RematSpecModifier.default_config().set(
-                            #     remat_policies={
-                            #         "model.decoder.transformer.layer": RematSpec(
-                            #             prevent_cse=False,
-                            #             policy=offload_attention_proj_policy,
-                            #         ),
-                            #     }
-                            # ),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=False,
+                                        policy=jax_remat_policies1.nothing_saveable,
+                                    ),
+                                }
+                            ),
                             V6eFlashConfigModifier.default_config(),
                             #GradientAccumulationModifier.default_config().set(grad_acc_steps=4),
                         ],
