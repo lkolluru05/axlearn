@@ -784,6 +784,7 @@ def mixture_train_input_source(
     replace_newlines_with: str = "<n>",
     fake_input_source_cfg: Optional[ConfigOr] = None,
     seed: Optional[int] = 42,
+    gbs=None,
 ) -> BuildDatasetFn:
     """Build mixture training input source for decoder-only LM model using grain.
 
@@ -900,7 +901,12 @@ def mixture_train_input_source(
         mixed_ds = sample_from_datasets(sources=sources, weights=weights)
 
         # Shard the mixed dataset
-        gbs=len(jax.devices())
+        gbs=256
+        gbs=int(gbs // jax.process_count())
+        logging.info("local devices by lk: %s", str(len(jax.local_devices())))
+        logging.info("global devices by lk: %s", str(len(jax.devices())))
+        logging.info("process count by lk: %s", str(jax.process_count()))
+        logging.info("gbs by lk: %s", str(gbs))
         return mixed_ds.batch(gbs)
 
     return build_dataset_fn
@@ -994,6 +1000,7 @@ def colocated_batches(dummy_array,cfg,sharding):
 
 from axlearn.common.config import maybe_instantiate, maybe_set_config
 from jax.experimental import mesh_utils
+from jax._src.layout import Format
 
 @colocated_python.colocated_python_class
 class RemoteInputAnnotate():
@@ -1016,9 +1023,12 @@ class RemoteInputAnnotate():
         )
         self.test_val=None
         devices = mesh_utils.create_device_mesh(cfg.mesh_shape)
-
+        logging.info("devices in remote colocated: %s", str(devices))
         # 4. Create the formal JAX Mesh
         self.mesh = jax.sharding.Mesh(devices, axis_names=cfg.mesh_axis_names)
+        
+        #logging.info("dll value in remote: %s", str(dll))
+        
         logging.info("Mesh shape from remote iterator: %s",str(self.mesh))
 
         
@@ -1066,8 +1076,19 @@ class RemoteInputAnnotate():
         
     
     def make_array(self,x1):
-        x=self.t_input_batch1
+        
+        x = self.t_input_batch1
+
         logging.info("In make array function")
+
+        x = jax.tree_util.tree_map(jnp.asarray, x)
+
+
+        #logging.info("####### lkolluru jax.local_devices() are %s, shape is %s", jax.local_devices(),  x.shape)
+        # for k, v in x.items():
+        #     x[k] = jnp.asarray(v)
+        #     logging.info("####### aireen jax.local_devices() are %s, local_data key is %s, shape is %s", jax.local_devices(), str(k), x[k].shape)
+
         if self.partition_specs == utils.DataPartitionType.FULL:
             global_shape = (x.shape[0] * self.process_count, *x.shape[1:])
         elif self.partition_specs == utils.DataPartitionType.REPLICATED:
@@ -1079,11 +1100,16 @@ class RemoteInputAnnotate():
             
         logging.info("global shape in remote conversion :%s",str(global_shape))
         logging.info("x value in make_array func ")
-        return jax.make_array_from_process_local_data(
-                sharding=jax.sharding.NamedSharding(self.mesh, self.partition_spec),
+        gda = jax.make_array_from_process_local_data(
+                sharding=self.internal_sharding, #jax.sharding.NamedSharding(self.mesh, self.partition_spec),
                 local_data=x,
                 global_shape=global_shape,
         )
+
+        #layout = self.internal_sharding.with_layout()
+
+        #return jax.device_put(gda, self.internal_sharding)
+        return gda
 
     def host_to_global_array_remote(self,x) :
     
@@ -1099,11 +1125,18 @@ class RemoteInputAnnotate():
         self.mesh = self.mesh #thread_resources.env.physical_mesh
 
         logging.info("Mesh shape in remote conversion :%s",str(self.mesh))
+
         self.partition_specs = utils.complete_partition_spec_tree(
             jax.tree_util.tree_structure(self.t_input_batch1),
             utils.data_partition_type_to_spec(self.partition_spec),
         )
         self.process_count = jax.process_count()
+
+        from jax.sharding import PartitionSpec as P
+
+        # Convert the dict to a PartitionSpec
+        #spec = P(*self.partition_specs) if isinstance(self.partition_specs, (list, tuple)) else P(**self.partition_specs)
+        self.internal_sharding = jax.sharding.NamedSharding(self.mesh, self.partition_spec)
 
         return jax.tree.map(self.make_array, x)
     

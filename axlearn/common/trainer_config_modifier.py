@@ -610,6 +610,8 @@ class GrainConfigModifier(ConfigModifier):
         )
         max_sequence_length = tf_data_config.max_sequence_length
         replace_newlines_with = tf_data_config.replace_newlines_with
+        #gbs = tf_data_config.train_batch_size
+        #logging.info("gbs in grain modifier by lk: %s", str(gbs))
 
         # Use the existing mixture_train_input_source function which already handles
         # GCS path conversion and fs.listdir operations
@@ -621,6 +623,7 @@ class GrainConfigModifier(ConfigModifier):
             max_sequence_length=max_sequence_length,
             replace_newlines_with=replace_newlines_with,
             seed=42,
+            gbs=256,
         )
 
     def _convert_input_to_grain(self, input_config: Configurable.Config) -> Configurable.Config:

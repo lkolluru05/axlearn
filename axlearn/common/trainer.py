@@ -620,6 +620,7 @@ class SpmdTrainer(Module):
                 
                 partition_spec = self._train_step_input_partition_specs()
                 logging.info("Partition spec in trainer: %s", str(partition_spec))
+                
                 self.remoteiterator = RemoteInputAnnotate(cfg,partition_spec)
                 out = self.remoteiterator.init_check(self.x)
                 self.remote_iter = self.remoteiterator.dataset(self.x)
