@@ -843,9 +843,9 @@ def mixture_train_input_source(
                         "Please provide a fake_input_source_cfg instead."
                 )
             logging.info("dataset name: %s", dataset_name)
-            glob_pattern = os.path.join(data_dir, dataset_name, "*array_record*")
+            glob_pattern = os.path.join(data_dir, dataset_name, "c4-train.array_record*")
             arrayrecord_files = fs.glob(glob_pattern)
-            logging.info("array record files: %s", arrayrecord_files)
+            logging.info("array record file count: %s", len(arrayrecord_files))
             if not arrayrecord_files:
                 raise ValueError(f"No files found for pattern {glob_pattern}")
             arrayrecord_dataset_dir = os.path.dirname(arrayrecord_files[0])
@@ -901,13 +901,14 @@ def mixture_train_input_source(
         mixed_ds = sample_from_datasets(sources=sources, weights=weights)
 
         # Shard the mixed dataset
-        gbs=256
-        gbs=int(gbs // jax.process_count())
+        gbs=32  # hardcoded for now, should get from config
+        bs=int(gbs // jax.process_count()) # batch size for each host to load
         logging.info("local devices by lk: %s", str(len(jax.local_devices())))
         logging.info("global devices by lk: %s", str(len(jax.devices())))
         logging.info("process count by lk: %s", str(jax.process_count()))
         logging.info("gbs by lk: %s", str(gbs))
-        return mixed_ds.batch(gbs)
+        logging.info("bs by lk: %s", str(bs))
+        return mixed_ds.batch(bs)
 
     return build_dataset_fn
 
@@ -1000,14 +1001,47 @@ def colocated_batches(dummy_array,cfg,sharding):
 
 from axlearn.common.config import maybe_instantiate, maybe_set_config
 from jax.experimental import mesh_utils
-from jax._src.layout import Format
+import jax.tree_util as jtu
+from functools import partial
+
+class RemoteWrapper():
+    """We need this wrapper because put_to_tpu_devices should happen outside colocated python,
+    so that JAX sees the correct tpu_sharding. Inside colocated python, JAX only sees CPUs.
+    See the get_next() function.
+    """
+    def __init__(self, cfg, partition_spec, tpu_mesh, global_batch_size):
+        self.cpu_devices = colocated_python.colocated_cpu_devices(jax.local_devices())
+        self.tpu_devices = jax.local_devices()
+        self.cpu_mesh = colocated_python.colocated_cpu_devices(tpu_mesh)
+        self.tpu_sharding = jax.sharding.NamedSharding(tpu_mesh, jax.sharding.PartitionSpec(tpu_mesh.axis_names))
+        self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, jax.sharding.PartitionSpec(self.cpu_mesh.axis_names))
+        self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+        self.x = jax.device_put(self.dummy_array, self.cpu_sharding)
+        self.remote_input_annotated = RemoteInputAnnotate(cfg, partition_spec, global_batch_size)
+        self.remote_input_annotated.init_check(self.x)
+        self.remote_input_annotated.dataset(self.x)
+
+    def get_next(self):
+        out = self.remote_input_annotated.get_next2(self.x)
+        
+        def put_to_tpu_devices(path, array, sharding):
+            logging.info("putting to tpu devices")
+            try:
+                return jax.device_put(array, sharding)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.info(f"Error putting data to TPU device path{path}, exception={e}")
+                raise
+        input_gdas = jtu.tree_map_with_path(partial(put_to_tpu_devices, sharding=self.tpu_sharding), out)
+
+        return input_gdas        
+        
 
 @colocated_python.colocated_python_class
 class RemoteInputAnnotate():
     """A Module to generate input batches with `grain`."""
 
-    def __init__(self, cfg,partition_spec):
-        
+    def __init__(self, cfg, partition_spec, global_batch_size):
+
         self.cfg=cfg
         logging.info("test")
         self.source = maybe_instantiate(cfg.input.source)
@@ -1017,20 +1051,11 @@ class RemoteInputAnnotate():
             child_config = maybe_set_config(cfg.input.input_dispatcher, partition_spec=cfg.input.partition_spec)
             child_config.name = "input_dispatcher"
             self.input_dispatcher: BaseInputDispatcher = child_config.instantiate(parent=self)
-        
+
         self.input_partitioner = maybe_instantiate(
             cfg.input.input_partitioner
         )
-        self.test_val=None
-        devices = mesh_utils.create_device_mesh(cfg.mesh_shape)
-        logging.info("devices in remote colocated: %s", str(devices))
-        # 4. Create the formal JAX Mesh
-        self.mesh = jax.sharding.Mesh(devices, axis_names=cfg.mesh_axis_names)
-        
-        #logging.info("dll value in remote: %s", str(dll))
-        
-        logging.info("Mesh shape from remote iterator: %s",str(self.mesh))
-
+        self.global_batch_size = global_batch_size
         
 
     def init_check(self,x):
@@ -1052,8 +1077,63 @@ class RemoteInputAnnotate():
         logging.info("iter created")
         return x
     
-    
     def get_next(self, x):
+        logging.info("In get next func")
+        t = next(self.local_iter2)
+        t1 = utils.as_numpy_array(t)
+        if self.input_dispatcher:
+            t1 = self.input_dispatcher.logical_to_physical_batch(t1)
+
+        logging.info("t1 shapes: %s", jax.tree.map(lambda x: x.shape, t1))
+
+        def form_global_array_colocated_python(path, array, devices, global_batch_size, sharding):
+            try:
+                device_arrays = np.split(array, len(devices), axis=0)
+            except ValueError as array_split_error:
+                raise ValueError(
+                    f"Unable to put to devices shape {array.shape} with "
+                    f"local device count {len(devices)} "
+                    f"at {jtu.keystr(path)}"
+                ) from array_split_error
+            #logging.info("putting device_array of shape %s, and global_shape %s to device: %s", str(device_arrays.shape), str(global_shape), str(devices))
+            device_arrays = jax.device_put(device_arrays, devices)
+            return jax.make_array_from_single_device_arrays(
+                shape=(global_batch_size, *array.shape[1:]), sharding=sharding, arrays=device_arrays
+            )
+
+        return jtu.tree_map_with_path(
+            partial(
+                form_global_array_colocated_python,
+                devices=list(x.sharding.addressable_devices),
+                global_batch_size=self.global_batch_size,
+                sharding=x.sharding,
+            ),
+            t1,
+        )             
+    
+    def get_next2(self, x):
+        logging.info("In get_next2 func")
+        t = next(self.local_iter2)
+        t1 = utils.as_numpy_array(t)
+        if self.input_dispatcher:
+            t1 = self.input_dispatcher.logical_to_physical_batch(t1)
+        #del t1['target_num_bytes']
+        logging.info("t1 shapes: %s", jax.tree.map(lambda x: x.shape, t1))
+        
+        def make_array(array, sharding, global_batch_size):
+            return jax.make_array_from_process_local_data(
+                    sharding=sharding,
+                    local_data=array,
+                    global_shape=(global_batch_size, *array.shape[1:]),
+            )
+
+        return jtu.tree_map(
+            partial(make_array, sharding=x.sharding, global_batch_size=self.global_batch_size),
+            t1,
+        )
+        
+    
+    def get_next_original(self, x):
         """Yields per-feed physical input batches (using `input_dispatcher` if configured).
 
         The caller should use `host_to_global_array` to construct a global physical batch from the
@@ -1061,7 +1141,7 @@ class RemoteInputAnnotate():
 
         See also `dispatch_global_batch` for constructing a global logical batch.
         """
-        logging.info("In get next func")
+        logging.info("In get next original func")
         t = next(self.local_iter2)
         t1 = utils.as_numpy_array(t)
         if self.input_dispatcher:
