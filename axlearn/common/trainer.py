@@ -62,7 +62,7 @@ from axlearn.common.utils import (
     match_regex_rules,
     thread_stack_traces,
 )
-from axlearn.common.input_grain import RemoteInputAnnotate
+from axlearn.common.input_grain import RemoteInputAnnotate, RemoteWrapper
 import jax.experimental.colocated_python as colocated_python
 from jax.experimental import mesh_utils
 
@@ -315,13 +315,13 @@ class SpmdTrainer(Module):
             )
 
             
-            self.cpu_devices = colocated_python.colocated_cpu_devices(jax.local_devices())
-            self.tpu_devices = jax.local_devices()
-            self.cpu_mesh = colocated_python.colocated_cpu_devices(mesh)
-            self.tpu_sharding = jax.sharding.NamedSharding(mesh, PartitionSpec(mesh.axis_names))
-            self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, PartitionSpec(self.cpu_mesh.axis_names))
-            self.dummy_array = jnp.zeros((len(self.cpu_devices)))
-            self.x = jax.device_put(self.dummy_array, self.cpu_sharding)
+            # self.cpu_devices = colocated_python.colocated_cpu_devices(jax.local_devices())
+            # self.tpu_devices = jax.local_devices()
+            # self.cpu_mesh = colocated_python.colocated_cpu_devices(mesh)
+            # self.tpu_sharding = jax.sharding.NamedSharding(mesh, PartitionSpec(mesh.axis_names))
+            # self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, PartitionSpec(self.cpu_mesh.axis_names))
+            # self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+            # self.x = jax.device_put(self.dummy_array, self.cpu_sharding)
             
 
             self._input_iter = iter(self.input.dataset())
@@ -620,20 +620,17 @@ class SpmdTrainer(Module):
                 
                 partition_spec = self._train_step_input_partition_specs()
                 logging.info("Partition spec in trainer: %s", str(partition_spec))
-                
-                self.remoteiterator = RemoteInputAnnotate(cfg,partition_spec)
-                out = self.remoteiterator.init_check(self.x)
-                self.remote_iter = self.remoteiterator.dataset(self.x)
-                
 
-                #input_iterator = self.input.batches(self._input_iter)
-                
+                global_batch_size = 32 # hardcoded for now, should get from config
+                self.remoteiterator = RemoteWrapper(cfg, partition_spec, self._mesh, global_batch_size)
+
                 while True:
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
                         #input_batch = next(input_iterator)
-                        input_batch = self.remoteiterator.get_next(self.x)
-                        #logging.info("input_batch: %s", str(input_batch)) ### gives out arrays ####
+                        logging.info("Trying to get_next()")
+                        input_batch = self.remoteiterator.get_next()
+                        logging.info("input_batch shapes: %s", utils.shapes(input_batch)) ### gives out arrays ####
                         self._maybe_record_event(measurement.Event.END_DATA_LOADING)
                         logging.log_first_n(
                             logging.INFO, "host_input_batch=%s", 3, utils.shapes(input_batch)
