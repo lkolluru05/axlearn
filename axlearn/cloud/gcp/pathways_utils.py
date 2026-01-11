@@ -94,8 +94,9 @@ _PATHWAYS_SERVER_IMAGE = (
 
 # The docker image used by pathways resource manager container and worker container.
 _COLOCATED_IMAGE = (
-    "us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/server:"
-    f"{_PATHWAYS_COLOCATED_IMAGE_TAG}"
+    # "us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/server:"
+    # f"{_PATHWAYS_COLOCATED_IMAGE_TAG}"
+    "us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated:pygraincolocated"
 )
 
 
@@ -602,9 +603,11 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
     def _colocated_python_container(self):
         cfg: PathwaysReplicatedJob.Config = self.config
         #cmd_args = ["/bin/sleep", "infinity"]
+        
+       
         return dict(
             name=_COLOCATED_PYTHON_SIDECAR_NAME,
-            image="us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated:pygraincolocated", #self._bundler.id(cfg.name),
+            image=_COLOCATED_IMAGE, #self._bundler.id(cfg.name),
             restartPolicy="Always",
             env=[
                 {

@@ -784,7 +784,8 @@ def mixture_train_input_source(
     replace_newlines_with: str = "<n>",
     fake_input_source_cfg: Optional[ConfigOr] = None,
     seed: Optional[int] = 42,
-    gbs=None,
+    gbs: Optional[int] = None,
+    data_dir: Optional[str] = None,
 ) -> BuildDatasetFn:
     """Build mixture training input source for decoder-only LM model using grain.
 
@@ -810,9 +811,12 @@ def mixture_train_input_source(
     from axlearn.common.config import maybe_instantiate, maybe_set_config
 
     data_mixture_components = maybe_instantiate(data_mixture_components)
+    
 
     def build_dataset_fn(
             dispatch_config: DispatchConfig,
+            gbs = gbs,
+            data_dir = data_dir,
         ) -> Dataset:
         sources = []
         weights = []
@@ -834,8 +838,9 @@ def mixture_train_input_source(
             #     for f in all_files
             #     if "array_record" in f
             # ]
-
-            data_dir = "gs://tpu-prod-env-multipod-axlearn/tensorflow-datasets/tensorflow_datasets/array_record"   ## set env in colocated image ######utils.get_data_dir()
+            
+            data_dir = data_dir #utils.get_data_dir()#"gs://tpu-prod-env-multipod-axlearn/tensorflow-datasets/tensorflow_datasets/array_record"   ## set env in colocated image ######utils.get_data_dir()
+            data_dir += "/array_record"
             logging.info("data dir: %s", data_dir)
             if data_dir == "FAKE":
                 raise ValueError(
@@ -843,7 +848,7 @@ def mixture_train_input_source(
                         "Please provide a fake_input_source_cfg instead."
                 )
             logging.info("dataset name: %s", dataset_name)
-            glob_pattern = os.path.join(data_dir, dataset_name, "*array_record*")
+            glob_pattern = os.path.join(data_dir, dataset_name, "c4-train.array_record*")
             arrayrecord_files = fs.glob(glob_pattern)
             logging.info("array record files: %s", arrayrecord_files)
             if not arrayrecord_files:
@@ -900,114 +905,72 @@ def mixture_train_input_source(
         # Mix the datasets
         mixed_ds = sample_from_datasets(sources=sources, weights=weights)
 
+        from absl import flags
+
+        FLAGS=flags.FLAGS
         # Shard the mixed dataset
-        gbs=256
-        gbs=int(gbs // jax.process_count())
-        logging.info("local devices by lk: %s", str(len(jax.local_devices())))
-        logging.info("global devices by lk: %s", str(len(jax.devices())))
-        logging.info("process count by lk: %s", str(jax.process_count()))
-        logging.info("gbs by lk: %s", str(gbs))
-        return mixed_ds.batch(gbs)
+        if FLAGS.enable_colocated_python_pygrain_data_input:
+
+            gbs=int(gbs // jax.process_count())
+            logging.info("local devices by lk: %s", str(len(jax.local_devices())))
+            logging.info("global devices by lk: %s", str(len(jax.devices())))
+            logging.info("process count by lk: %s", str(jax.process_count()))
+            logging.info("gbs by lk: %s", str(gbs))
+            return mixed_ds.batch(gbs)
+        else:
+
+            return mixed_ds.batch(gbs)
 
     return build_dataset_fn
 
 
 from jax.experimental import colocated_python
 from axlearn.common import utils
-from collections.abc import Iterator, Iterable
-from axlearn.common.input_dispatch import BaseInputDispatcher, InputDispatcher
 
-def colocated_dataset(dummy_array,cfg,sharding,read_config):
-    @colocated_python.colocated_python
-    def maybe_to_iter_dataset_remoteinput(dummy_array):
-        source = maybe_instantiate(cfg.source)
-        ds = source(DispatchConfig(**read_config))
-        read_options = config_for_class(grain.ReadOptions)
-        read_options = maybe_instantiate(read_options)
-        logging.info("read_options in colocated: %s",str(read_options))
-        if isinstance(ds, grain.MapDataset):
-            logging.info("dataset by lk: %s", ds)
-            ds = ds.to_iter_dataset(read_options)
-            logging.info("dataset by lk2: %s", ds)
-            try:
-                colocated_python._ = ds
-                colocated_python._dummy = "dummy"
-            except Exception as e:
-                logging.info("exception caused: %s",str(e))
-
-            logging.info("In colocated dataset function")
-        return dummy_array
-    
-    maybe_to_iter_dataset_remoteinput_spec = maybe_to_iter_dataset_remoteinput.specialize(
-            in_specs=(
-                (
-                    jax.ShapeDtypeStruct(
-                        shape=dummy_array.shape, 
-                        dtype=jnp.float32, 
-                        sharding=sharding, 
-                    ),
-                ),
-                {},
-            ),
-            
-            out_specs_fn=lambda result: jax.ShapeDtypeStruct(
-                shape=dummy_array.shape,  
-                dtype=jnp.float32, 
-                sharding=sharding,
-                ),
-        )
-    out = jax.block_until_ready(maybe_to_iter_dataset_remoteinput_spec(dummy_array))
-    #out.block_until_ready()
-    return out
-
-def colocated_batches(dummy_array,cfg,sharding):
-
-    @colocated_python.colocated_python
-    def maybe_batches_remoteinput(dummy_array):
-        logging.info("In colocated batches function")
-        d = colocated_python._dummy
-        logging.info("d value in colocated batches : %s", d)
-        it = iter(colocated_python._ds)
-        for input_batch in it:
-            input_batch = as_numpy_array(input_batch)
-            logging.info("input batches in colocated python before: %s",str(input_batch))
-            if "input_dispatcher" in self.children:
-                input_batch = self.input_dispatcher.logical_to_physical_batch(input_batch)
-                logging.info("input batches in colocated python after: %s",str(input_batch))
-        return dummy_array
-    
-    maybe_batches_remoteinput_spec = maybe_batches_remoteinput.specialize(
-            in_specs=(
-                (
-                    jax.ShapeDtypeStruct(
-                        shape=dummy_array.shape, 
-                        dtype=jnp.float32, 
-                        sharding=sharding, 
-                    ),
-                ),
-                {},
-            ),
-            
-            out_specs_fn=lambda result: jax.ShapeDtypeStruct(
-                shape=dummy_array.shape,  
-                dtype=jnp.float32, 
-                sharding=sharding,
-                ),
-        )
-    out = jax.block_until_ready(maybe_batches_remoteinput_spec(dummy_array))
-    #out.block_until_ready()  
-    return out 
+from axlearn.common.input_dispatch import BaseInputDispatcher
 
 from axlearn.common.config import maybe_instantiate, maybe_set_config
-from jax.experimental import mesh_utils
-from jax._src.layout import Format
+
+import jax.tree_util as jtu
+from functools import partial
+
+class RemoteWrapper():
+    """We need this wrapper because put_to_tpu_devices should happen outside colocated python,
+    so that JAX sees the correct tpu_sharding. Inside colocated python, JAX only sees CPUs.
+    See the get_next() function.
+    """
+    def __init__(self, cfg, partition_spec, tpu_mesh, global_batch_size):
+        self.cpu_devices = colocated_python.colocated_cpu_devices(jax.local_devices())
+        self.tpu_devices = jax.local_devices()
+        self.cpu_mesh = colocated_python.colocated_cpu_devices(tpu_mesh)
+        self.tpu_sharding = jax.sharding.NamedSharding(tpu_mesh, jax.sharding.PartitionSpec(tpu_mesh.axis_names))
+        self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, jax.sharding.PartitionSpec(self.cpu_mesh.axis_names))
+        self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+        self.x = jax.device_put(self.dummy_array, self.cpu_sharding)
+        self.remote_input_annotated = RemoteInputAnnotate(cfg, partition_spec, global_batch_size)
+        #self.remote_input_annotated.init_check(self.x)
+        self.remote_input_annotated.dataset(self.x)
+
+    def get_next(self):
+        out = self.remote_input_annotated.get_next(self.x)
+
+        def put_to_tpu_devices(path, array, sharding):
+            logging.info("putting to tpu devices")
+            try:
+                return jax.device_put(array, sharding)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.info(f"Error putting data to TPU device path{path}, exception={e}")
+                raise
+        input_gdas = jtu.tree_map_with_path(partial(put_to_tpu_devices, sharding=self.tpu_sharding), out)
+
+        return input_gdas  
 
 @colocated_python.colocated_python_class
 class RemoteInputAnnotate():
     """A Module to generate input batches with `grain`."""
 
-    def __init__(self, cfg,partition_spec):
-        
+    def __init__(self, cfg, partition_spec, global_batch_size):
+
         self.cfg=cfg
         logging.info("test")
         self.source = maybe_instantiate(cfg.input.source)
@@ -1017,28 +980,12 @@ class RemoteInputAnnotate():
             child_config = maybe_set_config(cfg.input.input_dispatcher, partition_spec=cfg.input.partition_spec)
             child_config.name = "input_dispatcher"
             self.input_dispatcher: BaseInputDispatcher = child_config.instantiate(parent=self)
-        
+
         self.input_partitioner = maybe_instantiate(
             cfg.input.input_partitioner
         )
-        self.test_val=None
-        devices = mesh_utils.create_device_mesh(cfg.mesh_shape)
-        logging.info("devices in remote colocated: %s", str(devices))
-        # 4. Create the formal JAX Mesh
-        self.mesh = jax.sharding.Mesh(devices, axis_names=cfg.mesh_axis_names)
+        self.global_batch_size = global_batch_size
         
-        #logging.info("dll value in remote: %s", str(dll))
-        
-        logging.info("Mesh shape from remote iterator: %s",str(self.mesh))
-
-        
-
-    def init_check(self,x):
-        logging.info("init_check called")
-        self.test_val = x
-        logging.info("checked and worked")
-        return x
-    
 
     def dataset(self,x):
         if  self.input_dispatcher:
@@ -1052,197 +999,26 @@ class RemoteInputAnnotate():
         logging.info("iter created")
         return x
     
+              
     
     def get_next(self, x):
-        """Yields per-feed physical input batches (using `input_dispatcher` if configured).
-
-        The caller should use `host_to_global_array` to construct a global physical batch from the
-        per-feed physical batches returned from this method.
-
-        See also `dispatch_global_batch` for constructing a global logical batch.
-        """
-        logging.info("In get next func")
+        logging.info("In get_next func")
         t = next(self.local_iter2)
         t1 = utils.as_numpy_array(t)
         if self.input_dispatcher:
-            self.t_input_batch1 = self.input_dispatcher.logical_to_physical_batch(t1)
-
+            t1 = self.input_dispatcher.logical_to_physical_batch(t1)
+        #del t1['target_num_bytes']
+        logging.info("t1 shapes: %s", jax.tree.map(lambda x: x.shape, t1))
         
-        test_array_tpu = self.host_to_global_array_remote(
-                                x
-                            )
-        logging.info("Test array tpu: %s", str(test_array_tpu))
-        return test_array_tpu
-        
-    
-    def make_array(self,x1):
-        
-        x = self.t_input_batch1
-
-        logging.info("In make array function")
-
-        x = jax.tree_util.tree_map(jnp.asarray, x)
-
-
-        #logging.info("####### lkolluru jax.local_devices() are %s, shape is %s", jax.local_devices(),  x.shape)
-        # for k, v in x.items():
-        #     x[k] = jnp.asarray(v)
-        #     logging.info("####### aireen jax.local_devices() are %s, local_data key is %s, shape is %s", jax.local_devices(), str(k), x[k].shape)
-
-        if self.partition_specs == utils.DataPartitionType.FULL:
-            global_shape = (x.shape[0] * self.process_count, *x.shape[1:])
-        elif self.partition_specs == utils.DataPartitionType.REPLICATED:
-            global_shape = (x.shape[0], *x.shape[1:])
-        elif isinstance(self.partition_specs, (utils.PartitionSpec, dict)):
-            global_shape = None  # Allow jax to infer.
-        else:
-            raise NotImplementedError(f"Unsupported partition: {self.partition_specs}")
-            
-        logging.info("global shape in remote conversion :%s",str(global_shape))
-        logging.info("x value in make_array func ")
-        gda = jax.make_array_from_process_local_data(
-                sharding=self.internal_sharding, #jax.sharding.NamedSharding(self.mesh, self.partition_spec),
-                local_data=x,
-                global_shape=global_shape,
-        )
-
-        #layout = self.internal_sharding.with_layout()
-
-        #return jax.device_put(gda, self.internal_sharding)
-        return gda
-
-    def host_to_global_array_remote(self,x) :
-    
-        logging.info("In host to global array remote")
-        
-        if isinstance(self.partition_spec, utils.DataPartitionType):
-            logging.log_first_n(
-                logging.WARNING,
-                "Passing DataPartitionType is deprecated. Please specify a PartitionSpec directly.",
-                n=1,
+        def make_array(array, sharding, global_batch_size):
+            return jax.make_array_from_process_local_data(
+                    sharding=sharding,
+                    local_data=array,
+                    global_shape=(global_batch_size, *array.shape[1:]),
             )
 
-        self.mesh = self.mesh #thread_resources.env.physical_mesh
-
-        logging.info("Mesh shape in remote conversion :%s",str(self.mesh))
-
-        self.partition_specs = utils.complete_partition_spec_tree(
-            jax.tree_util.tree_structure(self.t_input_batch1),
-            utils.data_partition_type_to_spec(self.partition_spec),
+        return jtu.tree_map(
+            partial(make_array, sharding=x.sharding, global_batch_size=self.global_batch_size),
+            t1,
         )
-        self.process_count = jax.process_count()
-
-        from jax.sharding import PartitionSpec as P
-
-        # Convert the dict to a PartitionSpec
-        #spec = P(*self.partition_specs) if isinstance(self.partition_specs, (list, tuple)) else P(**self.partition_specs)
-        self.internal_sharding = jax.sharding.NamedSharding(self.mesh, self.partition_spec)
-
-        return jax.tree.map(self.make_array, x)
     
-    def element_spec(self):
-        """Infers the element spec.
-
-        Grain requires fetching an example from the dataset to extract the spec. To avoid reading
-        actual data, replace your source dataset with one from `input_fake.fake_grain_source`.
-        """
-        ds = self.iter_dataset
-
-        if isinstance(ds, grain.MapDataset):
-            example = ds[0]
-            logging.info("example in if: %s", str(example))
-        else:
-            example = next(ds.__iter__())  # pylint: disable=unnecessary-dunder-call
-            logging.info("example in else: %s", str(example))
-
-        def shape_dtype(x):
-            if not hasattr(x, "shape") or not hasattr(x, "dtype"):
-                raise ValueError(f"element_spec() requires Tensor-like leaves, got: {x}.")
-            return jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
-
-        return jax.tree.map(shape_dtype, example)
-
-class RemoteInput(input_base.Input):
-    """A Module to generate input batches with `grain`."""
-
-    @config_class
-    class Config(input_base.Input.Config):
-        """Configures Input.
-
-        Attributes:
-            source: A BuildDatasetFn (or a config instantiating to one). The result dataset will
-                contain a stream of examples representing one epoch of the source dataset.
-        """
-
-        source: Required[ConfigOr[BuildDatasetFn]] = REQUIRED
-
-    def __init__(self, cfg: Config, *, parent: Optional[Module]):
-        super().__init__(cfg, parent=parent)
-        cfg: RemoteInput.Config = self.config
-        self._source = maybe_instantiate(cfg.source)
-        self.cfg = cfg
-        self.cpu_devices = colocated_python.colocated_cpu_devices(jax.local_devices())
-        self.cpu_mesh = jax.sharding.Mesh(self.cpu_devices, axis_names=("cpu_axis",))
-        self.global_x = jnp.arange(len(self.cpu_devices), dtype=jnp.float32)
-        self.sharding = jax.sharding.NamedSharding(self.cpu_mesh, jax.sharding.PartitionSpec("cpu_axis"))
-        self.x_cpu = jax.device_put(self.global_x, self.sharding)
-        
-
-    @property
-    def source(self) -> BuildDatasetFn:
-        return self._source
-
-    def dataset(self) -> grain.IterDataset:
-        if "input_dispatcher" in self.children:
-            # TODO(markblee): Generalize to support ndim>1.
-            read_config = self.input_dispatcher.feed_read_config()
-        else:
-            read_config = dict(shard_index=[jax.process_index()], num_shards=[jax.process_count()])
-
-        #### this works#####
-        out = colocated_dataset(self.x_cpu,self.cfg,self.sharding,read_config)  
-        logging.info("out array in dataset : %s", str(out))      
-
-        return maybe_to_iter_dataset(self._source(DispatchConfig(**read_config)))
-    
-    def batches(self, it):
-        """Yields per-feed physical input batches (using `input_dispatcher` if configured).
-
-        The caller should use `host_to_global_array` to construct a global physical batch from the
-        per-feed physical batches returned from this method.
-
-        See also `dispatch_global_batch` for constructing a global logical batch.
-        """
-        out = colocated_batches(self.x_cpu,self.cfg,self.sharding)
-        logging.info("out array in batches : %s", str(out)) 
-
-        for input_batch in it:
-            input_batch = utils.as_numpy_array(input_batch)
-            if "input_dispatcher" in self.children:
-                input_batch = self.input_dispatcher.logical_to_physical_batch(input_batch)
-            yield input_batch
-        
-
-    def element_spec(self) -> utils.Nested[jax.ShapeDtypeStruct]:
-        """Infers the element spec.
-
-        Grain requires fetching an example from the dataset to extract the spec. To avoid reading
-        actual data, replace your source dataset with one from `input_fake.fake_grain_source`.
-        """
-        ds = self.dataset()
-
-        if isinstance(ds, grain.MapDataset):
-            example = ds[0]
-            logging.info("example in if: %s", str(example))
-        else:
-            example = next(ds.__iter__())  # pylint: disable=unnecessary-dunder-call
-            logging.info("example in else: %s", str(example))
-
-        def shape_dtype(x):
-            if not hasattr(x, "shape") or not hasattr(x, "dtype"):
-                raise ValueError(f"element_spec() requires Tensor-like leaves, got: {x}.")
-            return jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
-
-        return jax.tree.map(shape_dtype, example)
-
-

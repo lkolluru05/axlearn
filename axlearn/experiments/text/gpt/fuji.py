@@ -45,7 +45,6 @@ from axlearn.common.trainer_config_modifier import (
     FP8ConfigModifier,
     GradientAccumulationModifier,
     GrainConfigModifier,
-    RemoteGrainConfigModifier,
     MeshShapeModifier,
     ModuleConfigModifier,
     PartitionSpecModifier,
@@ -1156,10 +1155,12 @@ def trainer_configs(
                 # pytype: disable=annotation-type-mismatch
                 cfg: SpmdTrainer.Config = config_map[base_config_name]().clone()
                 # pytype: enable=annotation-type-mismatch
+                train_batch_size = kwargs.pop("train_batch_size")
 
                 # Apply grain config modifier to convert tf.data to Grain
                 grain_modifier = GrainConfigModifier.default_config().set(
                     convert_training_input=True,
+                    train_batch_size = train_batch_size,
                 )
                 cfg = grain_modifier.instantiate()(cfg)
                 return cfg

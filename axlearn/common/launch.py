@@ -92,6 +92,7 @@ flags.DEFINE_multi_string(
     "implementation dependent. Not specifying a spec is equivalent to passing `None` to `setup`.\n"
     "If specifying multiple modules, each `setup` context is entered in the given order.",
 )
+flags.DEFINE_boolean("enable_colocated_python_pygrain_data_input", False, "Specifies the XLA backend to use.", required=False)
 
 FLAGS = flags.FLAGS
 
