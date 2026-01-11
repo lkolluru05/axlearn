@@ -62,7 +62,10 @@ from axlearn.common.utils import (
     match_regex_rules,
     thread_stack_traces,
 )
+from axlearn.common.input_grain import RemoteWrapper
+from absl import flags
 
+FLAGS=flags.FLAGS
 
 class TrainerState(NamedTuple):
     prng_key: Union[Tensor, TensorSpec, jax.sharding.NamedSharding]
@@ -300,6 +303,8 @@ class SpmdTrainer(Module):
 
         # Create all children within the mesh context so that utils.input_partition_spec() works
         # properly.
+        
+        
         with self.mesh():
             if cfg.batch_axis_names is not None:
                 cfg.input = maybe_set_config(
@@ -308,8 +313,9 @@ class SpmdTrainer(Module):
             self.input: Input = self._add_child(
                 "input", maybe_set_config(cfg.input, is_training=True)
             )
-            # Start from the beginning of the input dataset by default.
+
             self._input_iter = iter(self.input.dataset())
+            logging.info("in Trainer input_iter : %s",str(self._input_iter))
             cfg.summary_writer.dir = cfg.summary_writer.dir or os.path.join(
                 cfg.dir, "summaries", "train_train"
             )
@@ -602,14 +608,27 @@ class SpmdTrainer(Module):
                 stop_trace_step = None
 
                 input_iterator = self.input.batches(self._input_iter)
+
+                if FLAGS.enable_colocated_python_pygrain_data_input:
+                    partition_spec = self._train_step_input_partition_specs()
+                    logging.info("Partition spec in trainer: %s", str(partition_spec))
+                    global_batch_size = cfg.input.input_dispatcher.global_logical_batch_size 
+                    self.remoteiterator = RemoteWrapper(cfg, partition_spec, self._mesh, global_batch_size)
+                  
                 while True:
                     self._maybe_record_event(measurement.Event.START_DATA_LOADING)
                     try:
-                        input_batch = next(input_iterator)
+                        if FLAGS.enable_colocated_python_pygrain_data_input:
+                            input_batch_remote = self.remoteiterator.get_next()
+                            logging.info("input_batch shapes in colocated: %s", utils.shapes(input_batch_remote)) ### gives out arrays ####
+                        else:
+                            input_batch = next(input_iterator)
+                            logging.log_first_n(
+                                logging.INFO, "host_input_batch shapes: %s", 3, utils.shapes(input_batch)
+                            )
+
                         self._maybe_record_event(measurement.Event.END_DATA_LOADING)
-                        logging.log_first_n(
-                            logging.INFO, "host_input_batch=%s", 3, utils.shapes(input_batch)
-                        )
+                        
 
                         # Stop or start tracing if necessary.
                         stop_trace_step = self._maybe_stop_or_start_tracing(stop_trace_step, output)
@@ -617,20 +636,32 @@ class SpmdTrainer(Module):
                         self._step = self._step + 1
                         self.vlog(3, "Start step %s", self.step)
                         self._maybe_record_event(measurement.Event.START_STEP, self._step)
-                        output = self._run_step(
-                            utils.host_to_global_array(
-                                input_batch,
-                                partition=self._train_step_input_partition_specs(),
-                            ),
-                            force_run_evals=(
-                                force_run_eval_sets_at_max_step
-                                if self.step >= cfg.max_step
-                                else None
-                            ),
-                        )
+                        
+                        if FLAGS.enable_colocated_python_pygrain_data_input:
+                            output = self._run_step(
+                                input_batch_remote,
+                                force_run_evals=(
+                                    force_run_eval_sets_at_max_step
+                                    if self.step >= cfg.max_step
+                                    else None
+                                ),
+                            )
+                        else:
+                            partition_spec= self._train_step_input_partition_specs()
+                            output = self._run_step(
+                                utils.host_to_global_array(
+                                    input_batch,
+                                    partition=self._train_step_input_partition_specs(),
+                                ),
+                                force_run_evals=(
+                                    force_run_eval_sets_at_max_step
+                                    if self.step >= cfg.max_step
+                                    else None
+                                ),
+                            )
                         self.vlog(3, "Done step %s", self.step)
                         num_steps += 1
-                        if num_steps % 100 == 0:
+                        if num_steps % 1 == 0:
                             now = time.perf_counter()
                             average_step_time = (now - start_time) / num_steps
                             self._step_log("Average step time: %s seconds", average_step_time)
@@ -1116,7 +1147,7 @@ class SpmdTrainer(Module):
             # Run the compiled function.
             self._trainer_state, outputs = compiled_train_step_fn(self.trainer_state, input_batch)
 
-        n = self._config.log_every_n_steps or 100
+        n = self._config.log_every_n_steps or 1
         if self.step % n == 0 or 0 <= self.step <= 5:
             self._step_log(
                 "loss=%s aux=%s",

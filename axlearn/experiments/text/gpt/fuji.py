@@ -14,6 +14,7 @@ import enum
 import functools
 import itertools
 from typing import Any, List, NamedTuple, Optional, Union
+from absl import logging
 
 from jax.ad_checkpoint import checkpoint_policies as jax_remat_policies
 
@@ -32,7 +33,7 @@ from axlearn.common.attention import (
     StackedTransformerLayer,
 )
 from axlearn.common.base_layer import RematSpec
-from axlearn.common.config import TrainerConfigFn, config_for_function
+from axlearn.common.config import config_for_function
 from axlearn.common.decoder import LmHead
 from axlearn.common.embedding import TransformerTextEmbeddings
 from axlearn.common.flash_attention.layer import FlashBlockSizeModifier
@@ -43,6 +44,7 @@ from axlearn.common.trainer_config_modifier import (
     ChainConfigModifier,
     FP8ConfigModifier,
     GradientAccumulationModifier,
+    GrainConfigModifier,
     MeshShapeModifier,
     ModuleConfigModifier,
     PartitionSpecModifier,
@@ -65,9 +67,9 @@ from axlearn.experiments.text.gpt.common import (
 )
 from axlearn.experiments.text.gpt.common import model_config as common_model_config
 from axlearn.experiments.text.gpt.common import scaled_hidden_dim
-from axlearn.experiments.trainer_config_utils import V6eFlashConfigModifier
+from axlearn.experiments.trainer_config_utils import TrainerConfigFn, V6eFlashConfigModifier
 
-MODEL_SIZES = ("test", "1B", "3B", "7B", "8B", "70B", "405B")
+MODEL_SIZES = ("test", "1B", "3B", "7B", "8B", "70B")
 
 
 class Version(enum.Enum):
@@ -89,7 +91,7 @@ VOCAB_SIZE = {
 # Mapping from Fuji versions to maximum sequence lengths.
 MAX_SEQUENCE_LENGTH = {
     Version.V1: 2048,
-    Version.V2: 4096,
+    Version.V2: 2048,
     Version.V3: 8192,
     Version.V3_TIKTOKEN: 8192,
 }
@@ -120,7 +122,6 @@ TOTAL_TOKENS = {
         "3B": 15 * (1024**4),  # 15T tokens
         "7B": 15 * (1024**4),  # 15T tokens
         "70B": 15 * (1024**4),  # 15T tokens
-        "405B": 15 * (1024**4),  # 15T tokens
     },
     Version.V3_TIKTOKEN: {
         "test": 15 * (1024**4),  # 15T tokens
@@ -128,7 +129,6 @@ TOTAL_TOKENS = {
         "3B": 15 * (1024**4),  # 15T tokens
         "8B": 15 * (1024**4),  # 15T tokens
         "70B": 15 * (1024**4),  # 15T tokens
-        "405B": 15 * (1024**4),  # 15T tokens
     },
 }
 
@@ -398,6 +398,8 @@ def get_trainer_kwargs(
             ),
         )
     elif model_size == "7B":
+        import jax
+        from jax import checkpoint_policies as jax_remat_policies1
         trainer_kwargs = dict(
             model_kwargs=dict(
                 num_layers=32,
@@ -410,7 +412,7 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=3e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
+            train_batch_size=len(jax.devices()),#int(train_batch_size/jax.process_count()), #train_batch_size,
             max_step=max_step,
             mesh_shape=mesh_shape_from_axes(data=-1, fsdp=8),
             mesh_rules=(
@@ -440,6 +442,36 @@ def get_trainer_kwargs(
                                 }
                             ),
                             GradientAccumulationModifier.default_config().set(grad_acc_steps=4),
+                        ],
+                    ),
+                ),
+                (
+                    "tpu-v5litepod-32",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=mesh_shape_from_axes(data=1, fsdp=-1),
+                            ),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=False,
+                                        policy=config_for_function(
+                                            save_and_offload_only_these_names_regex
+                                        ).set(
+                                            names_which_can_be_saved="|".join(
+                                                [
+                                                    RematRegexSavePatterns.FLASH_ATTENTION.value,
+                                                    ".*linear1_0",
+                                                ]
+                                            ),
+                                            names_which_can_be_offloaded=None,
+                                            offload_src="device",
+                                            offload_dst="pinned_host",
+                                        ),
+                                    ),
+                                }
+                            ),
                         ],
                     ),
                 ),
@@ -490,11 +522,31 @@ def get_trainer_kwargs(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
                                         prevent_cse=False,
-                                        policy=offload_attention_proj_policy,
+                                        policy=jax_remat_policies.dots_saveable,
                                     ),
                                 }
                             ),
                             V6eFlashConfigModifier.default_config(),
+                        ],
+                    ),
+                ),
+                (
+                    "tpu-v6e-256",
+                    ChainConfigModifier.default_config().set(
+                        config_modifiers=[
+                            MeshShapeModifier.default_config().set(
+                                mesh_shape=mesh_shape_from_axes(data=-1, fsdp=256)
+                            ),
+                            RematSpecModifier.default_config().set(
+                                remat_policies={
+                                    "model.decoder.transformer.layer": RematSpec(
+                                        prevent_cse=False,
+                                        policy=jax_remat_policies1.nothing_saveable,
+                                    ),
+                                }
+                            ),
+                            V6eFlashConfigModifier.default_config(),
+                            #GradientAccumulationModifier.default_config().set(grad_acc_steps=4),
                         ],
                     ),
                 ),
@@ -665,6 +717,7 @@ def get_trainer_kwargs(
             ),
         )
     elif model_size == "70B":
+        import jax
         trainer_kwargs = dict(
             model_kwargs=dict(
                 num_layers=80,
@@ -680,7 +733,7 @@ def get_trainer_kwargs(
             ),
             learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
             max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
+            train_batch_size=len(jax.devices()), #train_batch_size,
             max_step=max_step,
             mesh_shape=mesh_shape_from_axes(fsdp=-1),
             mesh_rules=(
@@ -836,52 +889,6 @@ def get_trainer_kwargs(
                             ),
                             *trn2_config.module_modifications,
                             *trn2_config.partition_spec_modifications,
-                        ],
-                    ),
-                ),
-            ),
-        )
-    elif model_size == "405B":
-        trainer_kwargs = dict(
-            model_kwargs=dict(
-                num_layers=126,
-                hidden_dim=16384,
-                ffn_dim=53248,
-                num_heads=128,
-                # No GQA support in V1 models, so num_kv_heads is the same as num_heads.
-                num_kv_heads=None if version == Version.V1 else 8,
-                rope_theta=rope_theta,
-                shared_lm_head=False,
-                flash_attention=flash_attention,
-            ),
-            learner_kwargs=dict(peak_lr=1.5e-4, weight_decay=0.1),
-            max_sequence_length=max_sequence_length,
-            train_batch_size=train_batch_size,
-            max_step=max_step,
-            mesh_shape=mesh_shape_from_axes(fsdp=-1),
-            mesh_rules=(
-                (
-                    "tpu-v5p-.*",
-                    ChainConfigModifier.default_config().set(
-                        config_modifiers=[
-                            MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(fsdp=-1)
-                            ),
-                            RematSpecModifier.default_config().set(
-                                remat_policies={
-                                    "model.decoder.transformer.layer": RematSpec(
-                                        prevent_cse=False,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved=None,
-                                            names_which_can_be_offloaded=None,
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
-                                    ),
-                                }
-                            ),
                         ],
                     ),
                 ),
@@ -1129,5 +1136,48 @@ def trainer_configs(
                     make_single_host_config, f"{config_name}-fp8"
                 )
                 config_map[f"{config_name}-fp8-single-host"] = make_single_host_fp8_config_func
+
+        if model_size in ("7B"):
+
+            def make_grain_config(base_config_name: str) -> SpmdTrainer.Config:
+                """Make a grain input processor variant of the base config.
+
+                This configuration uses the grain input processing framework for
+                improved data loading and preprocessing performance.
+
+                Args:
+                    base_config_name: The base config name.
+
+                Returns:
+                    A trainer config that uses grain input processing.
+                """
+
+                # pytype: disable=annotation-type-mismatch
+                cfg: SpmdTrainer.Config = config_map[base_config_name]().clone()
+                # pytype: enable=annotation-type-mismatch
+                train_batch_size = kwargs.pop("train_batch_size")
+
+                # Apply grain config modifier to convert tf.data to Grain
+                grain_modifier = GrainConfigModifier.default_config().set(
+                    convert_training_input=True,
+                    train_batch_size = train_batch_size,
+                )
+                cfg = grain_modifier.instantiate()(cfg)
+                return cfg
+
+            # Make grain config
+            logging.info("In fuji, 7B , Pygrain implementation")
+            make_grain_config_func = functools.partial(make_grain_config, config_name)
+            config_map[f"{config_name}-grain"] = make_grain_config_func
+
+            logging.info("config_map")
+            logging.info(config_map)
+
+            # Make grain configs for FP8
+            if f"{config_name}-fp8" in config_map:
+                make_grain_fp8_config_func = functools.partial(
+                    make_grain_config, f"{config_name}-fp8"
+                )
+                config_map[f"{config_name}-fp8-grain"] = make_grain_fp8_config_func
 
     return config_map

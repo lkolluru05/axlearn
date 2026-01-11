@@ -30,6 +30,9 @@ On `repeat` and `shuffle`:
 * `repeat` with `num_repeat=None` will produce datasets with size `sys.maxsize`.
 """
 
+
+import json
+import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, Sequence, TypeVar, Union, runtime_checkable
@@ -42,8 +45,9 @@ from absl import logging
 from array_record.python.array_record_data_source import PathLikeOrFileInstruction
 from grain._src.python.data_loader import _determine_worker_count
 from grain._src.python.dataset import dataset as dataset_base
-from jax.experimental import multihost_utils
+from jax.experimental import multihost_utils, colocated_python
 
+from axlearn.common import file_system as fs
 from axlearn.common import input_base, utils
 from axlearn.common.config import (
     REQUIRED,
@@ -51,6 +55,7 @@ from axlearn.common.config import (
     Required,
     config_class,
     config_for_class,
+    config_for_function,
     maybe_instantiate,
 )
 from axlearn.common.module import Module
@@ -417,8 +422,11 @@ def maybe_to_iter_dataset(
         A `grain.IterDataset`.
     """
     read_options = maybe_instantiate(read_options)
+    logging.info("read_options: %s",str(read_options))
     if isinstance(ds, grain.MapDataset):
+        logging.info("dataset by lk: %s", ds)
         ds = ds.to_iter_dataset(read_options)
+        logging.info("dataset by lk2: %s", ds)
     return ds
 
 
@@ -751,10 +759,13 @@ class Input(input_base.Input):
         actual data, replace your source dataset with one from `input_fake.fake_grain_source`.
         """
         ds = self.dataset()
+
         if isinstance(ds, grain.MapDataset):
             example = ds[0]
+            logging.info("example in if: %s", str(example))
         else:
             example = next(ds.__iter__())  # pylint: disable=unnecessary-dunder-call
+            logging.info("example in else: %s", str(example))
 
         def shape_dtype(x):
             if not hasattr(x, "shape") or not hasattr(x, "dtype"):
@@ -762,3 +773,252 @@ class Input(input_base.Input):
             return jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
 
         return jax.tree.map(shape_dtype, example)
+
+def mixture_train_input_source(
+    *,
+    is_training: bool,
+    vocab_cfg: ConfigOr,
+    preprocessor: Union[ConfigOr, list[ConfigOr]],
+    data_mixture_components: Union[ConfigOr, list],
+    max_sequence_length: int,
+    replace_newlines_with: str = "<n>",
+    fake_input_source_cfg: Optional[ConfigOr] = None,
+    seed: Optional[int] = 42,
+    gbs: Optional[int] = None,
+    data_dir: Optional[str] = None,
+) -> BuildDatasetFn:
+    """Build mixture training input source for decoder-only LM model using grain.
+
+    Mixture sampling happens after input processing but before batching, meaning that each batch
+    example will only contain tokens from a single source.
+
+    Args:
+        is_training: A boolean indicating that inputs will be used for training.
+        vocab_cfg: Config to instantiate the seqio vocab.
+        preprocessor: A single or a list of lm text preprocessor config(s). When
+            used as a list, each preprocessor must correspond to one data source;
+            when used as a single config, it will be broadcast for all data sources.
+        data_mixture_components: List of DataMixtureComponent(s).
+        max_sequence_length: Maximum sequence length of an example.
+        replace_newlines_with: Value to replace newlines with in the text.
+        fake_input_source_cfg: A config that instantiates to a BuildDatasetFn for the input source
+            used during unittest.
+        seed: Seed for any downstream transformations (e.g. `shuffle` or `random_map`).
+
+    Returns:
+        A BuildDatasetFn that mixes the given list of DataMixtureComponent(s).
+    """
+    from axlearn.common.config import maybe_instantiate, maybe_set_config
+
+    data_mixture_components = maybe_instantiate(data_mixture_components)
+    
+
+    def build_dataset_fn(
+            dispatch_config: DispatchConfig,
+            gbs = gbs,
+            data_dir = data_dir,
+        ) -> Dataset:
+        sources = []
+        weights = []
+
+        for component in data_mixture_components:
+            dataset_name = component.name.replace(":", "/")
+
+            # # Construct ArrayRecord paths
+            # arrayrecord_dataset_dir = os.path.join(
+            #     "/tmp/tensorflow_datasets/array_record", dataset_name
+            # )
+
+            # # Use fs.listdir to list all files in the directory
+            # all_files = fs.listdir(arrayrecord_dataset_dir)
+
+            # # Filter for arrayrecord files
+            # arrayrecord_files = [
+            #     os.path.join(arrayrecord_dataset_dir, f)
+            #     for f in all_files
+            #     if "array_record" in f
+            # ]
+            
+            data_dir = data_dir #utils.get_data_dir()#"gs://tpu-prod-env-multipod-axlearn/tensorflow-datasets/tensorflow_datasets/array_record"   ## set env in colocated image ######utils.get_data_dir()
+            data_dir += "/array_record"
+            logging.info("data dir: %s", data_dir)
+            if data_dir == "FAKE":
+                raise ValueError(
+                        "FAKE data_dir should be handled by fake_input_source_cfg. "
+                        "Please provide a fake_input_source_cfg instead."
+                )
+            logging.info("dataset name: %s", dataset_name)
+            glob_pattern = os.path.join(data_dir, dataset_name, "c4-train.array_record*")
+            arrayrecord_files = fs.glob(glob_pattern)
+            logging.info("array record files: %s", arrayrecord_files)
+            if not arrayrecord_files:
+                raise ValueError(f"No files found for pattern {glob_pattern}")
+            arrayrecord_dataset_dir = os.path.dirname(arrayrecord_files[0])
+
+            logging.info("array record dataset dir: %s", arrayrecord_dataset_dir)
+
+
+            # Create ArrayRecord dataset
+            source_ds = (
+                array_record_dataset(paths=arrayrecord_files, seed=seed).shuffle().repeat()
+            )
+            source_ds = shard_dataset(source_ds, dispatch_config)
+            #
+            features_json = os.path.join(arrayrecord_dataset_dir, "features.json")
+            # pylint: disable-next=import-outside-toplevel
+            import tensorflow_datasets as tfds
+
+            logging.info(
+                "Found %s; will assume tfds features and deserialize accordingly.", features_json
+            )
+            with fs.open(features_json) as f:
+                features_dict = tfds.features.FeaturesDict.from_json(json.load(f))
+            source_ds = source_ds.map(features_dict.deserialize_example_np)
+
+
+            # Apply preprocessing
+            def _set_config_for_preprocessor(p: ConfigOr) -> ConfigOr:
+                return maybe_set_config(
+                    p,
+                    vocab_cfg=vocab_cfg,
+                    max_sequence_length=max_sequence_length,
+                    replace_newlines_with=replace_newlines_with,
+                )
+
+            if isinstance(preprocessor, list):
+                assert len(preprocessor) == len(data_mixture_components)
+                processor_cfg = _set_config_for_preprocessor(preprocessor[len(sources)])
+            else:
+                processor_cfg = _set_config_for_preprocessor(preprocessor)
+
+            # Apply processor to the source dataset
+            processor_fn = maybe_instantiate(processor_cfg)
+            source_ds = processor_fn(source_ds)
+
+            # Repeat the dataset for mixing.
+            # Commenting this out because 'MapIterDataset' object has no attribute 'repeat'
+            #source_ds = source_ds.repeat()
+
+            sources.append(source_ds)
+            weights.append(component.weight)
+
+        # Mix the datasets
+        mixed_ds = sample_from_datasets(sources=sources, weights=weights)
+
+        from absl import flags
+
+        FLAGS=flags.FLAGS
+        # Shard the mixed dataset
+        if FLAGS.enable_colocated_python_pygrain_data_input:
+
+            gbs=int(gbs // jax.process_count())
+            logging.info("local devices by lk: %s", str(len(jax.local_devices())))
+            logging.info("global devices by lk: %s", str(len(jax.devices())))
+            logging.info("process count by lk: %s", str(jax.process_count()))
+            logging.info("gbs by lk: %s", str(gbs))
+            return mixed_ds.batch(gbs)
+        else:
+
+            return mixed_ds.batch(gbs)
+
+    return build_dataset_fn
+
+
+from jax.experimental import colocated_python
+from axlearn.common import utils
+
+from axlearn.common.input_dispatch import BaseInputDispatcher
+
+from axlearn.common.config import maybe_instantiate, maybe_set_config
+
+import jax.tree_util as jtu
+from functools import partial
+
+class RemoteWrapper():
+    """We need this wrapper because put_to_tpu_devices should happen outside colocated python,
+    so that JAX sees the correct tpu_sharding. Inside colocated python, JAX only sees CPUs.
+    See the get_next() function.
+    """
+    def __init__(self, cfg, partition_spec, tpu_mesh, global_batch_size):
+        self.cpu_devices = colocated_python.colocated_cpu_devices(jax.local_devices())
+        self.tpu_devices = jax.local_devices()
+        self.cpu_mesh = colocated_python.colocated_cpu_devices(tpu_mesh)
+        self.tpu_sharding = jax.sharding.NamedSharding(tpu_mesh, jax.sharding.PartitionSpec(tpu_mesh.axis_names))
+        self.cpu_sharding = jax.sharding.NamedSharding(self.cpu_mesh, jax.sharding.PartitionSpec(self.cpu_mesh.axis_names))
+        self.dummy_array = jnp.zeros((len(self.cpu_devices)))
+        self.x = jax.device_put(self.dummy_array, self.cpu_sharding)
+        self.remote_input_annotated = RemoteInputAnnotate(cfg, partition_spec, global_batch_size)
+        #self.remote_input_annotated.init_check(self.x)
+        self.remote_input_annotated.dataset(self.x)
+
+    def get_next(self):
+        out = self.remote_input_annotated.get_next(self.x)
+
+        def put_to_tpu_devices(path, array, sharding):
+            logging.info("putting to tpu devices")
+            try:
+                return jax.device_put(array, sharding)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.info(f"Error putting data to TPU device path{path}, exception={e}")
+                raise
+        input_gdas = jtu.tree_map_with_path(partial(put_to_tpu_devices, sharding=self.tpu_sharding), out)
+
+        return input_gdas  
+
+@colocated_python.colocated_python_class
+class RemoteInputAnnotate():
+    """A Module to generate input batches with `grain`."""
+
+    def __init__(self, cfg, partition_spec, global_batch_size):
+
+        self.cfg=cfg
+        logging.info("test")
+        self.source = maybe_instantiate(cfg.input.source)
+        self.tpu_devices = jax.local_devices()
+        self.partition_spec = partition_spec or utils.input_partition_spec()
+        if cfg.input.input_dispatcher is not None:
+            child_config = maybe_set_config(cfg.input.input_dispatcher, partition_spec=cfg.input.partition_spec)
+            child_config.name = "input_dispatcher"
+            self.input_dispatcher: BaseInputDispatcher = child_config.instantiate(parent=self)
+
+        self.input_partitioner = maybe_instantiate(
+            cfg.input.input_partitioner
+        )
+        self.global_batch_size = global_batch_size
+        
+
+    def dataset(self,x):
+        if  self.input_dispatcher:
+            # TODO(markblee): Generalize to support ndim>1.
+            read_config = self.input_dispatcher.feed_read_config()
+        else:
+            read_config = dict(shard_index=[jax.process_index()], num_shards=[jax.process_count()])
+        self.iter_dataset = maybe_to_iter_dataset(self.source(DispatchConfig(**read_config)))
+        self.local_iter = iter(self.iter_dataset)
+        self.local_iter2 = iter(self.iter_dataset)
+        logging.info("iter created")
+        return x
+    
+              
+    
+    def get_next(self, x):
+        logging.info("In get_next func")
+        t = next(self.local_iter2)
+        t1 = utils.as_numpy_array(t)
+        if self.input_dispatcher:
+            t1 = self.input_dispatcher.logical_to_physical_batch(t1)
+        #del t1['target_num_bytes']
+        logging.info("t1 shapes: %s", jax.tree.map(lambda x: x.shape, t1))
+        
+        def make_array(array, sharding, global_batch_size):
+            return jax.make_array_from_process_local_data(
+                    sharding=sharding,
+                    local_data=array,
+                    global_shape=(global_batch_size, *array.shape[1:]),
+            )
+
+        return jtu.tree_map(
+            partial(make_array, sharding=x.sharding, global_batch_size=self.global_batch_size),
+            t1,
+        )
+    
