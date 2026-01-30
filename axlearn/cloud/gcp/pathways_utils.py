@@ -223,6 +223,10 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
             restartPolicy="Always",
             env=[
                 {
+                    "name": "CLOUD_PATHWAYS_SIDECAR_SHM_DIRECTORY",
+                    "value": "/tmp",
+                },
+                {
                     "name": "GRPC_SERVER_ADDRESS",
                     "value": f"0.0.0.0:{_COLOCATED_CONTAINER_PORT}",
                 },
@@ -659,6 +663,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             # We use 1/4 of the host memory, rounding up to power of 2 as premapped buffer.
             # Note that pathways worker requires this flag to be a power of 2.
             f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory//4)*(1<<30)}",
+            "--cloud_pathways_sidecar_shm_directory=/tmp",
         ]
         mega_scale_args = xla_flags_from_options(self._mxla_options).split()
         worker_container["args"].extend(mega_scale_args)
@@ -962,8 +967,9 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             f"--server_port={_PATHWAYS_WORKER_PORT}",
             "--resource_manager_address=$(LWS_LEADER_ADDRESS):"
             + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
-            f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
         ]
+        print("args")
+        print(args)
         worker_container["args"] = args
         ports = worker_container.get("ports", [])
         ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
