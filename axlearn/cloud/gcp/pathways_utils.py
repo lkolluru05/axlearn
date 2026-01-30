@@ -91,9 +91,7 @@ _PATHWAYS_BACK_OFF_LIMIT = 32
 def get_colocated_python_image(image_id: str) -> str:
     path, tag = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
-    #return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag}"
-    return "us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated"
-
+    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag}"
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
     """Attempts to convert an XLA flag string value to int.
@@ -212,7 +210,7 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
     def __init__(self, cfg: Config, *, bundler: Bundler):
         super().__init__(cfg)
         sidecars = getattr(bundler.config, "sidecars", [])
-        self._enable_colocated_python = True #_COLOCATED_PYTHON_SIDECAR_NAME in sidecars
+        self._enable_colocated_python = _COLOCATED_PYTHON_SIDECAR_NAME in sidecars
 
     # pylint: disable-next=no-self-use
     def build_colocated_python_container(self, image: str):
@@ -680,7 +678,6 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         ports = worker_container.get("ports", [])
         ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
         worker_container["ports"] = ports
-        
         worker_container["volumeMounts"]=[dict(name="shared-memory", mountPath="/tmp/ifrt_proxy")]
 
         # Command will be executed by the head node, and it will compile the model and
@@ -986,9 +983,9 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             f"--server_port={_PATHWAYS_WORKER_PORT}",
             "--resource_manager_address=$(LWS_LEADER_ADDRESS):"
             + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
         ]
-        print("args")
-        print(args)
+       
         worker_container["args"] = args
         ports = worker_container.get("ports", [])
         ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
