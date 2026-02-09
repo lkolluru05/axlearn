@@ -93,6 +93,7 @@ def get_colocated_python_image(image_id: str) -> str:
     repo, _ = path.rsplit("/", maxsplit=1)
     return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag}"
 
+
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
     """Attempts to convert an XLA flag string value to int.
 
@@ -231,13 +232,7 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
             ],
             imagePullPolicy="Always",
             ports=[dict(containerPort=_COLOCATED_CONTAINER_PORT)],
-            volumeMounts=[
-                {
-                    "mountPath": "/tmp/ifrt_proxy",
-                    "name": "shared-memory"
-                }
-            ],
-
+            volumeMounts=[{"mountPath": "/tmp/ifrt_proxy", "name": "shared-memory"}],
         )
 
     @property
@@ -668,8 +663,11 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             # We use 1/4 of the host memory, rounding up to power of 2 as premapped buffer.
             # Note that pathways worker requires this flag to be a power of 2.
             f"--tpu_premapped_buffer_size={round_up_to_power_of_2(host_memory//4)*(1<<30)}",
-            "--cloud_pathways_sidecar_shm_directory=/tmp/ifrt_proxy",
         ]
+        if self._colocated_python.is_colocated_python_enabled:
+            worker_container["args"].append(
+                "--cloud_pathways_sidecar_shm_directory=/tmp/ifrt_proxy"
+            )
         mega_scale_args = xla_flags_from_options(self._mxla_options).split()
         worker_container["args"].extend(mega_scale_args)
 
@@ -678,7 +676,10 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         ports = worker_container.get("ports", [])
         ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
         worker_container["ports"] = ports
-        worker_container["volumeMounts"]=[dict(name="shared-memory", mountPath="/tmp/ifrt_proxy")]
+        if self._colocated_python.is_colocated_python_enabled:
+            worker_container["volumeMounts"] = [
+                dict(name="shared-memory", mountPath="/tmp/ifrt_proxy")
+            ]
 
         # Command will be executed by the head node, and it will compile the model and
         # distribute works to workers.
@@ -704,21 +705,15 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pod_spec["containers"] = [
             self._build_pathways_worker_container(pathways_worker_replicated_job_index)
         ]
-        shared_memory_volume = {
-            "name": "shared-memory",
-            "hostPath": {
-                "path": "/tmp/ifrt_proxy",
-                "type": "DirectoryOrCreate"
-            }
-        }
-
-        pod_spec["volumes"].append(shared_memory_volume)
 
         if self._colocated_python.is_colocated_python_enabled:
             image = cfg.image_id or self._bundler.id(cfg.name)
             pod_spec["initContainers"].append(
                 self._colocated_python.build_colocated_python_container(image)
             )
+            shared_memory_volume = {"name": "shared-memory", "emptyDir": {"medium": "Memory"}}
+            pod_spec["volumes"].append(shared_memory_volume)
+
         worker_pod["spec"] = pod_spec
 
         # Service account for nodes.
@@ -985,12 +980,17 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             + f"{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--gcs_scratch_location={cfg.output_dir}/pathways-staging",
         ]
-       
+        if self._colocated_python.is_colocated_python_enabled:
+            args.append("--cloud_pathways_sidecar_shm_directory=/tmp/ifrt_proxy")
         worker_container["args"] = args
         ports = worker_container.get("ports", [])
         ports.append({"containerPort": _PATHWAYS_WORKER_PORT})
         worker_container["ports"] = ports
         worker_container["image"] = self._colocated_python.pathways_server_image
+        if self._colocated_python.is_colocated_python_enabled:
+            worker_container["volumeMounts"] = [
+                dict(name="shared-memory", mountPath="/tmp/ifrt_proxy")
+            ]
 
         worker_container.pop("command")
         return worker_container
@@ -1006,11 +1006,14 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         pod_spec.pop("restartPolicy")
         pod_spec["dnsPolicy"] = "ClusterFirstWithHostNet"
         pod_spec["containers"] = [self._build_pathways_worker_container()]
+
         if self._colocated_python.is_colocated_python_enabled:
             image = cfg.image_id or self._bundler.id(cfg.name)
             pod_spec["initContainers"].append(
                 self._colocated_python.build_colocated_python_container(image)
             )
+            shared_memory_volume = {"name": "shared-memory", "emptyDir": {"medium": "Memory"}}
+            pod_spec["volumes"].append(shared_memory_volume)
         worker_pod["spec"] = pod_spec
 
         # Service account for nodes.
