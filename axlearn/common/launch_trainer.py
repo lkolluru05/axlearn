@@ -80,6 +80,28 @@ flags.DEFINE_string(
     None,
     "The mesh selector string. See `SpmdTrainer.Config.mesh_rules` for details.",
 )
+flags.DEFINE_string(
+    "pw_rm_address",
+    None,
+    "The resource manager address of pathways head job . "
+    "Used for enabling subslicing feature for pathways.",
+)
+flags.DEFINE_boolean(
+    "enable_pwsubslice",
+    False,
+    "Used for enabling subslicing feature for pathways.",
+)
+flags.DEFINE_string(
+    "pwsubslice_instance_type",
+    None,
+    " Instance Type for  subslicing feature for pathways.",
+)
+flags.DEFINE_integer(
+    "pwsubslice_instance_count",
+    1,
+    " Repliacs of Instance Type for  subslicing feature for pathways.",
+)
+
 
 FLAGS = flags.FLAGS
 

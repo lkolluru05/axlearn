@@ -19,7 +19,7 @@ RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.
     curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     apt-get update -y -qq && \
     apt-get install -y -qq apt-transport-https ca-certificates gcc g++ \
-    git screen ca-certificates google-perftools google-cloud-cli python3.12-venv && \
+    git screen ca-certificates google-perftools google-cloud-cli python3.12-venv kubectl  google-cloud-sdk-gke-gcloud-auth-plugin && \
     apt clean -y -qq
 
 # Setup.
