@@ -56,7 +56,7 @@ def maybe_profile(enabled: bool, profile_dir: Optional[str]):
             jax.profiler.stop_trace()
 
 
-def create_mesh(mesh_shape=(1, 1, 1, 1, 1, 16, -1)):
+def create_mesh(mesh_shape=(1, 1, 1, 1, 1, 1, -1)):
     """Create a JAX mesh for distributed computation."""
     inferred_mesh_shape = infer_mesh_shape(mesh_shape)
     print(f"Using mesh shape {inferred_mesh_shape} for {len(jax.devices())} devices")
@@ -280,7 +280,7 @@ def main():
     parser.add_argument(
         "--num_iters",
         type=int,
-        default=1,
+        default=10,
         help="Number of times to repeat the load benchmark (default: 1)",
     )
     args = parser.parse_args()
@@ -331,8 +331,13 @@ def main():
             loaded_values = None
             with maybe_profile(args.profile, profile_dir):
                 for i in range(num_iterations):
+                    # Drop reference to TPU arrays and sleep for 150s for better memory observation.
                     if loaded_values is not None:
+                        print("In delete loaded_values")
                         del loaded_values
+                        loaded_values = None
+                        time.sleep(1)
+
                     print(f"\n--- Iteration {i + 1}/{num_iterations} ---")
                     start_time = time.perf_counter()
                     loaded_values = load_model(
@@ -341,14 +346,22 @@ def main():
                         global_shapes=global_shapes,
                         dtypes=dtypes,
                     )
+                    
+                    
                     elapsed = time.perf_counter() - start_time
                     print(f"✅ Successfully loaded model from {args.ckpt_path}")
                     print(f"Total time took {elapsed:.2f} seconds")
                     print(f"   Total parameters: {sum(x.size for x in loaded_values):,}")
+                    #del loaded_values
+
+                    # Sleep in between iterations.
+                    if i < num_iterations - 1:
+                        time.sleep(1)
     finally:
         # Always clean up, even if benchmark fails.
         if loaded_values is not None:
             cleanup_loaded_arrays(loaded_values)
+        print("Script ran successfully !!!!!")
 
 
 if __name__ == "__main__":

@@ -105,7 +105,8 @@ NOTARY_PROXY_GRPC_PORT = 39001
 def get_colocated_python_image(image_id: str) -> str:
     path, tag = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
-    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag}"
+    #return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag}"
+    return "us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated:pygraincolocated"
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
@@ -225,7 +226,7 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
     def __init__(self, cfg: Config, *, bundler: Bundler):
         super().__init__(cfg)
         sidecars = getattr(bundler.config, "sidecars", [])
-        self._enable_colocated_python = _COLOCATED_PYTHON_SIDECAR_NAME in sidecars
+        self._enable_colocated_python = True #_COLOCATED_PYTHON_SIDECAR_NAME in sidecars
 
     # pylint: disable-next=no-self-use
     def build_colocated_python_container(self, image: str):
