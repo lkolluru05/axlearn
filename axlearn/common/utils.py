@@ -54,6 +54,7 @@ from jax.ad_checkpoint import Offloadable, Recompute, Saveable
 from jax.experimental import mesh_utils, multihost_utils
 from jax.extend.core import Primitive
 from jax.sharding import PartitionSpec
+from pathwaysutils.elastic import manager
 
 from axlearn.common import serialization
 from axlearn.common.config import (
@@ -88,6 +89,8 @@ _enable_xla_runtime_errors = False
 
 # The set of supported floating point dtypes.
 _supported_float_dtypes = [jnp.bfloat16, jnp.float32]
+
+elastic_manager: manager.Manager | None = None
 
 
 @dataclasses.dataclass
