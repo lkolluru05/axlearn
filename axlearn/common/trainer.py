@@ -18,6 +18,7 @@ from absl import logging
 from jax import numpy as jnp
 from jax.experimental import multihost_utils
 from jax.experimental.pjit import pjit
+from pathwaysutils.elastic import manager
 
 from axlearn.common import file_system as fs
 from axlearn.common import measurement, utils
@@ -59,6 +60,7 @@ from axlearn.common.utils import (
     count_model_params,
     flatten_items,
     host_to_global_specs,
+    live_devices,
     match_regex_rules,
     thread_stack_traces,
 )
@@ -391,7 +393,8 @@ class SpmdTrainer(Module):
 
     def _step_log(self, msg, *args, **kwargs):
         logging.info(
-            "%s process % 3d step % 8d] " + msg,
+            "live_devices: %d ; %s process % 3d step % 8d ] " + msg,
+            len(live_devices()),
             self.path(),
             jax.process_index(),
             -1 if self.step is None else self.step,
@@ -630,7 +633,7 @@ class SpmdTrainer(Module):
                         )
                         self.vlog(3, "Done step %s", self.step)
                         num_steps += 1
-                        if num_steps % 100 == 0:
+                        if num_steps % 5 == 0:
                             now = time.perf_counter()
                             average_step_time = (now - start_time) / num_steps
                             self._step_log("Average step time: %s seconds", average_step_time)
@@ -1002,6 +1005,10 @@ class SpmdTrainer(Module):
             self.checkpointer.save(
                 step=self.step, state=ckpt_state, evaler_summaries=evaler_summaries
             )
+            print("Checkpoint saved !!!!")
+            if utils.elastic_manager is not None and utils.elastic_manager.new_slice_event.is_set():
+                logging.info("Interrupting as a new elastic slice event is seen")
+                raise manager.ScaleUpSignalError()
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
         """Restores trainer state by building it with init_state_builder."""
@@ -1053,7 +1060,8 @@ class SpmdTrainer(Module):
         cfg: SpmdTrainer.Config = self.config
         # Get device kinds and assert that they are homogenous.
         # TODO(markblee): Get devices from self._mesh.devices.
-        device_kinds = set(d.device_kind for d in jax.devices())
+        # device_kinds = set(d.device_kind for d in jax.devices())  #### may be here #####
+        device_kinds = set(d.device_kind for d in live_devices())
         if len(device_kinds) != 1:
             raise RuntimeError(f"Heterogenous device kinds ({device_kinds}) are not supported.")
         device_kind = device_kinds.pop()

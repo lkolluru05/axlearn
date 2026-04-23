@@ -765,7 +765,7 @@ def get_trainer_config_fn(
 
         train_dispatcher_cfg = elastic_input.ElasticSpmdInputDispatcher.default_config().set(
             global_logical_batch_size=train_batch_size,
-            num_max_slices=1,
+            num_max_slices=2,
         )
 
         cfg.input = elastic_input.ElasticInput.default_config().set(
@@ -809,7 +809,7 @@ def get_trainer_config_fn(
             cfg.evalers[name] = evaler_cfg
         # Summaries and checkpoints.
         cfg.checkpointer.save_policy = config_for_function(every_n_steps_and_last_policy).set(
-            n=save_every_n_steps or min(eval_every_n_steps, 5_000),
+            n=save_every_n_steps or min(eval_every_n_steps, 50),
             max_step=max_step,
         )
         cfg.checkpointer.keep_every_n_steps = min(max_step, keep_every_n_steps)

@@ -43,6 +43,7 @@ from typing import (
 import attr
 import jax
 import numpy as np
+import pathwaysutils
 from absl import logging
 from jax import numpy as jnp
 from jax._src.ad_checkpoint import name_p
@@ -91,6 +92,19 @@ _enable_xla_runtime_errors = False
 _supported_float_dtypes = [jnp.bfloat16, jnp.float32]
 
 elastic_manager: manager.Manager | None = None
+
+
+def live_devices():
+    device_list = jax.devices()
+
+    if pathwaysutils.is_pathways_backend_used() and elastic_manager is not None:
+        return [d for d in device_list if d.slice_index in elastic_manager.active_slice_indices]
+    else:
+        return device_list
+
+
+def live_slice_indices() -> set[int]:
+    return {d.slice_index for d in live_devices()}
 
 
 @dataclasses.dataclass
@@ -1799,7 +1813,8 @@ def create_device_mesh(
         NotImplementedError: If not all devices have the same platform.
     """
     if devices is None:
-        devices = jax.devices()
+        # devices = jax.devices()  ##### may be update here ###
+        devices = live_devices()
     devices = np.asarray(devices)
 
     # Check if the devices are part of a multi-granule configuration.
@@ -1910,7 +1925,8 @@ def infer_mesh_shape(mesh_shape: MeshShape, *, num_devices: Optional[int] = None
     # Handle the case with one -1.
     prod = math.prod(mesh_shape, start=-1)
     if num_devices is None:
-        num_devices = len(jax.devices())
+        # num_devices = len(jax.devices())  ###### may be update here ####
+        num_devices = len(live_devices())
     if num_devices % prod != 0:
         raise ValueError(
             f"Unable to infer -1 in mesh shape {mesh_shape} as num_devices {num_devices} "

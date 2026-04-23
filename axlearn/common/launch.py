@@ -45,7 +45,7 @@ if instance_type != "none":
 from absl import flags, logging
 
 from axlearn.common.status_server import StatusHTTPServer
-from axlearn.common.utils import get_data_dir
+from axlearn.common.utils import get_data_dir, live_devices
 from axlearn.common.utils_spmd import setup as setup_spmd
 
 # pylint: enable=wrong-import-position
@@ -142,7 +142,8 @@ def setup():
         status_server = StatusHTTPServer(FLAGS.status_port)
         status_server.start()
 
-    devices = jax.devices()
+    # devices = jax.devices()  ##### may be update here ####
+    devices = live_devices()
     logging.info("Devices: %s", devices)
     local_devices = jax.local_devices()
     logging.info("Local Devices: %s", local_devices)

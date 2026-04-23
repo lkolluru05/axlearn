@@ -47,6 +47,7 @@ from axlearn.common.utils import (
     flatten_items,
     get_data_dir,
     infer_mesh_shape,
+    live_devices,
     set_data_dir,
 )
 
@@ -479,7 +480,10 @@ class BaseConverterFromPretrainedModel(Converter):
                 cfg.mesh_axis_names or trainer_cfg.mesh_axis_names or ("data", "model")
             )
             trainer_cfg.mesh_shape = infer_mesh_shape(
-                cfg.mesh_shape or trainer_cfg.mesh_shape or (len(jax.devices()), 1)
+                # cfg.mesh_shape or trainer_cfg.mesh_shape or (len(jax.devices()), 1)
+                cfg.mesh_shape
+                or trainer_cfg.mesh_shape
+                or (len(live_devices()), 1)
             )
             # Reset datasets and evalers for the pretrained model config.
             # This input is not used. Set global_batch_size to 0 by default.

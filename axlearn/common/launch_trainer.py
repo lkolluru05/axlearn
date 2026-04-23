@@ -13,7 +13,7 @@ from axlearn.common import file_system as fs
 from axlearn.common import measurement
 from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config
-from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
+from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape, live_devices
 
 # Trainer-specific flags.
 flags.DEFINE_string(
@@ -115,7 +115,8 @@ def get_trainer_config(
     if flag_values.mesh_selector is not None:
         select_mesh_config(trainer_config, mesh_selector=flag_values.mesh_selector)
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
-    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
+    # trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
+    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(live_devices()), 1)
     if isinstance(trainer_config.mesh_shape, MeshShape):
         trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]

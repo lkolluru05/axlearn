@@ -17,16 +17,23 @@ enable_replica_resize = True
 def main(_):
     measurement.initialize(flags.FLAGS)
     launch.setup()
-    trainer_config = launch_trainer.get_trainer_config()
-    trainer_config.set(recorder=config_for_function(lambda: measurement.global_recorder))
-    measurement.start_monitoring()
+    # trainer_config = launch_trainer.get_trainer_config()
+    # trainer_config.set(recorder=config_for_function(lambda: measurement.global_recorder))
+    # measurement.start_monitoring()
 
     if pathwaysutils.is_pathways_backend_used() and enable_elastic_training:
 
         def train():
+            # measurement.initialize(flags.FLAGS)
+            # launch.setup()
+            trainer_config = launch_trainer.get_trainer_config()
+            trainer_config.set(recorder=config_for_function(lambda: measurement.global_recorder))
+            measurement.start_monitoring()
             launch_trainer.run_trainer(trainer_config)
 
         utils.elastic_manager = manager.Manager()
+
+        # utils.elastic_manager.live_devices = live_devices()
 
         if enable_pause_resume:
             print("Pathways backend with pause resume being used")
@@ -66,6 +73,11 @@ def main(_):
 
         train()
     else:
+        measurement.initialize(flags.FLAGS)
+        launch.setup()
+        trainer_config = launch_trainer.get_trainer_config()
+        trainer_config.set(recorder=config_for_function(lambda: measurement.global_recorder))
+        measurement.start_monitoring()
         launch_trainer.run_trainer(trainer_config)
 
 

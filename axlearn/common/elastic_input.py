@@ -49,7 +49,7 @@ from axlearn.common import input_base
 from axlearn.common.config import REQUIRED, Required, config_class, maybe_set_config
 from axlearn.common.input_dispatch import BaseInputDispatcher, _validate_logical_feed_shapes
 from axlearn.common.module import Module
-from axlearn.common.utils import Nested, Tensor
+from axlearn.common.utils import Nested, Tensor, live_devices
 
 
 class ElasticSpmdInputDispatcher(BaseInputDispatcher):
@@ -72,7 +72,10 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
 
     @property
     def is_in_elastic_mode(self) -> bool:
+        print("In is_in_elastic_mode by lkolluru")
         cfg = self.config
+        print("cfg.num_max_slices by lkolluru: ", cfg.num_max_slices)
+        print("slice_count by lkolluru: ", slice_count())
         if cfg.num_max_slices is None:
             return False
         else:
@@ -165,10 +168,22 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
         else:
             self._feed_logical_batch_size = cfg.global_logical_batch_size // self.feed_count
 
+        adjusted_device_physical_batch_size = math.ceil(
+            self._device_physical_batch_size * (cfg.num_max_slices / slice_count())
+        )
+        print(
+            "adjusted_device_physical_batch_size outside elastic by lkolluru: ",
+            adjusted_device_physical_batch_size,
+        )
+
         if self.is_in_elastic_mode:
             print(" In elastic mode lkolluru")
             adjusted_device_physical_batch_size = math.ceil(
                 self._device_physical_batch_size * (cfg.num_max_slices / slice_count())
+            )
+            print(
+                "adjusted_device_physical_batch_size inside elastic by lkolluru: ",
+                adjusted_device_physical_batch_size,
             )
             padding_per_device = (
                 adjusted_device_physical_batch_size - self._device_physical_batch_size
@@ -408,9 +423,14 @@ class ElasticInput(input_base.Input):
 
 def slice_count() -> int:
     """Returns the number of slices."""
-    slice_cnt_val = len(set(d.slice_index for d in jax.devices() if hasattr(d, "slice_index"))) or 1
+    # slice_cnt_val=len(set(d.slice_index for d in jax.devices() if hasattr(d, "slice_index"))) or 1
+    # print("slice_count by lkolluru: ", slice_cnt_val)
+    # return len(set(d.slice_index for d in jax.devices() if hasattr(d, "slice_index"))) or 1
+    slice_cnt_val = (
+        len(set(d.slice_index for d in live_devices() if hasattr(d, "slice_index"))) or 1
+    )
     print("slice_count by lkolluru: ", slice_cnt_val)
-    return len(set(d.slice_index for d in jax.devices() if hasattr(d, "slice_index"))) or 1
+    return len(set(d.slice_index for d in live_devices() if hasattr(d, "slice_index"))) or 1
 
 
 def process_count_per_slice() -> int:
@@ -419,7 +439,8 @@ def process_count_per_slice() -> int:
         len(
             set(
                 d.process_index
-                for d in jax.devices()
+                # for d in jax.devices()
+                for d in live_devices()
                 if hasattr(d, "slice_index") and d.slice_index == 0
             )
         )

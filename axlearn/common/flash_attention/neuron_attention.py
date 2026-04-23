@@ -17,12 +17,13 @@ from neuronxcc.nki.kernels.attention import flash_attn_bwd, flash_fwd
 from axlearn.common.attention_bias import BaseAttentionBias, CausalAttentionBias, split
 from axlearn.common.flash_attention.common import BaseFlashAttention, repeat_kv_heads
 from axlearn.common.kv_cache.base_kv_cache import BaseKVCache
-from axlearn.common.utils import Nested
+from axlearn.common.utils import Nested, live_devices
 
 # pytype: enable=import-error
 
 Tensor = jax.Array
-lnc = 2 if jax.devices()[0].device_kind == "NC_v3d" else 1
+# lnc = 2 if jax.devices()[0].device_kind == "NC_v3d" else 1
+lnc = 2 if live_devices()[0].device_kind == "NC_v3d" else 1
 
 
 # TODO(apoorvtintin): Add segment IDs as an argument when the kernel supports it.
