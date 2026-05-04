@@ -1814,25 +1814,33 @@ def create_device_mesh(
     """
     if devices is None:
         # devices = jax.devices()  ##### may be update here ###
+        print("lkolluru devices is None")
         devices = live_devices()
+
+    devices = live_devices()
     devices = np.asarray(devices)
 
     # Check if the devices are part of a multi-granule configuration.
     # <https://github.com/google/jax/blob/b81b79c1b0d2ec/jax/experimental/mesh_utils.py#L313>
     device_platform = devices[0].platform
     device_attr = "process_index" if device_platform != "tpu" else "slice_index"
+
     is_multi_granule_env = hasattr(devices[0], device_attr)
+    print(f"is_multi_granule_env: {is_multi_granule_env}")
     if not all(el.platform == device_platform for el in devices):
         raise NotImplementedError(f"Not all devices had platform: {device_platform}.")
 
     num_granules = (
-        max(getattr(el, device_attr) for el in devices.flatten()) + 1 if is_multi_granule_env else 1
+        len({getattr(el, device_attr) for el in devices.flatten()}) if is_multi_granule_env else 1
     )
+
     num_devices = len(devices)
+    print(f"num_devices: {num_devices}")
     assert (
         num_devices % num_granules == 0
     ), "Number of devices must be divisible by number of granules."
     num_devices_per_granule = num_devices // num_granules
+    print(f"num_devices_per_granule: {num_devices_per_granule}")
 
     # Fallback to a standard mesh if on GPU with incompatible multi-granule mesh.
     if (
