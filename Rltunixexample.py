@@ -280,27 +280,24 @@ class AXLearnNNXWrapper(nnx.Module):
         )
 
         # Proactively ensure the context stack is installed BEFORE tracing F
-        try:
-            from axlearn.common.module import current_context_stack
-            current_context_stack()
-        except Exception:
-            ctx = ContextStack(stack=[], thread_id=threading.get_ident())
-            install_context_stack(ctx)
-            
-        output_collection = new_output_collection()
-        context = InvocationContext(
-            name="root",
-            parent=None,
-            module=self.ax_model,
-            state=state,
-            prng_key=jax.random.PRNGKey(42),
-            output_collection=output_collection,
-            is_training=is_training,
-        )
-        with set_current_context(context):
-            outputs = self.ax_model.predict(input_batch=input_batch)
-        
+        from axlearn.common.module import _global_context_stack
+        if getattr(_global_context_stack, "thread_id", None) != threading.get_ident():
+            install_context_stack([])
 
+        print("Passed context stack")  
+        (_, aux), _ = F(
+            self.ax_model,
+            is_training=is_training,
+            prng_key=jax.random.PRNGKey(42),
+            state=state,
+            inputs=dict(input_batch=input_batch, return_aux=True),
+        )
+        print("passed Functional module")
+        outputs = aux["logits"]
+        print("passed output logits")
+        # Ensure outputs are fully replicated so Tunix can iterate over the generated token buffers.
+        outputs = jax.lax.with_sharding_constraint(outputs, jax.sharding.PartitionSpec())
+        print("passed outputs sharding constraint")
         if len(args) >= 4 or "prefill" in kwargs or "cache" in kwargs:
             return outputs, cache
         return outputs
@@ -347,6 +344,42 @@ def main(_):
     trainer_cfg, restored_state, mesh = get_fuji_trainer_and_state(FLAGS.ckpt_dir)
 
     optimizer = create_custom_optimizer()
+
+    # Monkey-patch Tunix sampler to ensure token_buffers are fully replicated across the mesh,
+    # preventing "assert self.is_fully_replicated or self.is_fully_addressable" errors
+    # during host-side iteration in multi-host environments.
+    import tunix.generate.sampler as sampler_module
+    if not hasattr(sampler_module.Sampler, "_patched_for_replication"):
+        _orig_init = sampler_module.Sampler.__init__
+
+        def _force_replicate_state(state):
+            def _replicate(x):
+                if hasattr(x, "sharding") and getattr(x.sharding, "mesh", None) is not None:
+                    if hasattr(x, "ndim") and x.ndim <= 3:
+                        if not (getattr(x, "is_fully_replicated", False) or getattr(x, "is_fully_addressable", False)):
+                            try:
+                                return jax.device_put(x, jax.sharding.NamedSharding(x.sharding.mesh, jax.sharding.PartitionSpec()))
+                            except Exception:
+                                pass
+                return x
+            return jax.tree_util.tree_map(_replicate, state)
+
+        def _patched_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            orig_prefill = self._compiled_prefill_fn
+            orig_decode = self._compiled_decode_fn
+            
+            def prefill_wrapper(*p_args, **p_kwargs):
+                return _force_replicate_state(orig_prefill(*p_args, **p_kwargs))
+            
+            def decode_wrapper(*d_args, **d_kwargs):
+                return _force_replicate_state(orig_decode(*d_args, **d_kwargs))
+                
+            self._compiled_prefill_fn = prefill_wrapper
+            self._compiled_decode_fn = decode_wrapper
+
+        sampler_module.Sampler.__init__ = _patched_init
+        sampler_module.Sampler._patched_for_replication = True
     
     cluster_config, grpo_config = create_tunix_config(
         mesh, optimizer, FLAGS.ckpt_dir
