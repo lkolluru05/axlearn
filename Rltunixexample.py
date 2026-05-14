@@ -128,9 +128,9 @@ def get_fuji_trainer_and_state(ckpt_dir: str):
     print(f"Restored state from step: {step}")
     return trainer_cfg, restored_state, mesh
 
-def dummy_reward_fn(generations, **kwargs):
+def dummy_reward_fn(prompts, completions, **kwargs):
     """A dummy reward function returning 1.0 for each generation."""
-    return jnp.ones(generations.shape[:2], dtype=jnp.float32)
+    return [1.0 for _ in completions]
 
 def create_tunix_config(mesh, optimizer, ckpt_dir: str):
     """Creates the Tunix cluster and GRPO configurations."""
@@ -177,6 +177,7 @@ def create_tunix_config(mesh, optimizer, ckpt_dir: str):
             top_p=TOP_P,
             top_k=TOP_K,
             eos_tokens=EOS_TOKENS,
+            return_logprobs=True,
         ),
     )
 
@@ -345,7 +346,45 @@ def main(_):
 
     optimizer = create_custom_optimizer()
 
-    
+    # Monkey-patch Tunix sampler to ensure token_buffers are fully replicated across the mesh,
+    # preventing "assert self.is_fully_replicated or self.is_fully_addressable" errors
+    # during host-side iteration in multi-host environments.
+    import tunix.generate.sampler as sampler_module
+    if not hasattr(sampler_module.Sampler, "_patched_for_replication"):
+        _orig_init = sampler_module.Sampler.__init__
+
+        @jax.jit
+        def _gather_array(x):
+            return jax.lax.with_sharding_constraint(x, jax.sharding.PartitionSpec())
+
+        def _force_replicate_state(state):
+            def _replicate(x):
+                if isinstance(x, jax.Array) and hasattr(x, "ndim") and x.ndim <= 3:
+                    if not (getattr(x, "is_fully_replicated", False) or getattr(x, "is_fully_addressable", False)):
+                        try:
+                            return _gather_array(x)
+                        except Exception:
+                            pass
+                return x
+            return jax.tree_util.tree_map(_replicate, state)
+
+        def _patched_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            orig_prefill = self._compiled_prefill_fn
+            orig_decode = self._compiled_decode_fn
+            
+            def prefill_wrapper(*p_args, **p_kwargs):
+                return _force_replicate_state(orig_prefill(*p_args, **p_kwargs))
+            
+            def decode_wrapper(*d_args, **d_kwargs):
+                return _force_replicate_state(orig_decode(*d_args, **d_kwargs))
+                
+            self._compiled_prefill_fn = prefill_wrapper
+            self._compiled_decode_fn = decode_wrapper
+
+        sampler_module.Sampler.__init__ = _patched_init
+        sampler_module.Sampler._patched_for_replication = True
+
     cluster_config, grpo_config = create_tunix_config(
         mesh, optimizer, FLAGS.ckpt_dir
     )
