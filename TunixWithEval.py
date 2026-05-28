@@ -4,6 +4,7 @@ import re
 import os
 import json
 import threading
+from typing import Any, Optional, Tuple
 
 # --- HOT-PATCH FOR FSSPEC GLOB BUG ---
 # Forces an upgrade of datasets/fsspec before any other library can cache the broken version.
@@ -49,6 +50,9 @@ import numpy as np
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.grpo.grpo_learner import GRPOConfig, GRPOLearner
 from tunix.rl.rollout import base_rollout
+from tunix.generate import sampler as tunix_sampler
+import functools
+import operator
 from tunix import MetricsLoggerOptions
 from flax import nnx
 from axlearn.common.module import functional as F, install_context_stack
@@ -201,6 +205,7 @@ def get_fuji_trainer_and_state(ckpt_dir: str):
 
         restore_state_specs = trainer_state_specs._asdict() if has_learner else {"model": model_param_specs}
         step, restored_state_dict = checkpointer.restore(step=None, state=restore_state_specs)
+        print("lkolluru checkpoint restored step:", step)
 
         prng_key = jax.random.PRNGKey(0)
         if step is None:
@@ -219,22 +224,22 @@ def get_fuji_trainer_and_state(ckpt_dir: str):
         restored_state = TrainerState(**{k: v for k, v in restored_state_dict.items() if k in TrainerState._fields})
         return trainer_cfg, restored_state, mesh
 
-def create_tunix_config(mesh, optimizer, ckpt_dir: str):
+def create_tunix_config(mesh, optimizer, model_dir: str):
     cluster_config = rl_cluster_lib.ClusterConfig(
         role_to_mesh={
             rl_cluster_lib.Role.ACTOR: mesh,
             rl_cluster_lib.Role.REFERENCE: mesh,
             rl_cluster_lib.Role.ROLLOUT: mesh,
         },
-        rollout_engine='vanilla',
+        rollout_engine=CustomGreedyRollout,
         training_config=rl_cluster_lib.RLTrainingConfig(
             actor_optimizer=optimizer,
             eval_every_n_steps=10,
             max_steps=100,
             mini_batch_size=2,
             train_micro_batch_size=2,
-            metrics_logging_options=MetricsLoggerOptions(log_dir=ckpt_dir),
-            checkpoint_root_directory=ckpt_dir,
+            metrics_logging_options=MetricsLoggerOptions(log_dir=model_dir),
+            checkpoint_root_directory=model_dir,
         ),
         rollout_config=base_rollout.RolloutConfig(
             max_tokens_to_generate=512,
@@ -314,6 +319,11 @@ class AXLearnNNXWrapper(nnx.Module):
         self.ax_model = model_cfg.set(name="model").instantiate(parent=None)
         self.params = nnx.data(jax.tree.map(nnx.Param, params))
         self.config = TunixConfigWrapper(self.ax_model)
+        flat_params = jax.tree.leaves(params)
+        means = [float(jnp.mean(p)) for p in flat_params]
+        stds = [float(jnp.std(p)) for p in flat_params]
+        has_nan = any(np.isnan(m) or np.isnan(s) for m, s in zip(means, stds))
+        print("lkolluru global param stats: mean =", np.mean(means), "std =", np.mean(stds), "has_nan =", has_nan)
 
     def __call__(self, *args, **kwargs):
         input_ids = args[0] if len(args) > 0 else kwargs.get("input_batch", kwargs.get("input_ids"))
@@ -460,6 +470,370 @@ class TunixTokenizerWrapper:
         
     def __getattr__(self, name): return getattr(self._adapter, name)
 
+class CustomRollout(base_rollout.BaseRollout):
+    def __init__(
+        self,
+        *,
+        rollout_actor,
+        tokenizer,
+        mesh,
+        rollout_config,
+    ):
+        kv_cache_size = getattr(rollout_config, "kv_cache_size", 2048)
+        self._model = rollout_actor
+        self._tokenizer = tokenizer
+        self._pad_id = tokenizer.pad_id()
+        self._eos_id = tokenizer.eos_id()
+        
+        cache_config = tunix_sampler.CacheConfig(
+            cache_size=kv_cache_size,
+            num_layers=rollout_actor.config.num_layers,
+            num_kv_heads=rollout_actor.config.num_kv_heads,
+            head_dim=rollout_actor.config.head_dim,
+        )
+        
+        self._sampler = tunix_sampler.Sampler(
+            rollout_actor,
+            tokenizer,
+            cache_config,
+        )
+        self._mesh = mesh
+        self._rollout_config = rollout_config
+
+    def generate(
+        self,
+        prompts: list[str],
+        rollout_config: base_rollout.RolloutConfig,
+        **kwargs,
+    ) -> base_rollout.RolloutOutput:
+        import inspect
+        sig = inspect.signature(self._sampler.__call__)
+        sampler_kwargs = {
+            "input_strings": prompts,
+            "max_generation_steps": rollout_config.max_tokens_to_generate,
+            "max_prompt_length": rollout_config.max_prompt_length,
+            "echo": False,
+            "temperature": rollout_config.temperature,
+            "top_p": rollout_config.top_p,
+            "top_k": rollout_config.top_k,
+            "seed": rollout_config.seed,
+            "pad_output": False,
+            "eos_tokens": rollout_config.eos_tokens,
+        }
+        if "return_logprobs" in sig.parameters:
+            sampler_kwargs["return_logprobs"] = rollout_config.return_logprobs
+            
+        with self._mesh:
+            output = self._sampler(**sampler_kwargs)
+        logprobs = getattr(output, "logprobs", None)
+        
+        return base_rollout.RolloutOutput(
+            text=output.text,
+            logits=output.logits,
+            tokens=output.tokens,
+            left_padded_prompt_tokens=output.padded_prompt_tokens,
+            logprobs=logprobs,
+        )
+
+    def get_per_token_logps(
+        self,
+        prompt_tokens: jax.Array,
+        completion_tokens: jax.Array,
+        completion_mask: jax.Array | None = None,
+    ) -> jax.Array:
+        from tunix.rl import common as rl_common
+        graphdef, state = self._sampler.model_def_and_state()
+        return rl_common.compute_per_token_logps(
+            graphdef,
+            state,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            pad_id=self.pad_id(),
+            eos_id=self.eos_id(),
+            completion_mask=completion_mask,
+            stop_gradient=True,
+            return_logits=False,
+        )
+
+    def update_params(
+        self,
+        params: Any,
+        filter_types: Optional[Tuple[Any, ...]] = None,
+    ) -> None:
+        from tunix.rl import reshard as rl_reshard
+        from tunix.rl import utils as rl_utils
+        
+        if filter_types is not None:
+            dst_params = nnx.state(self.model(), filter_types)
+            resharded_params = rl_reshard.reshard_pytree(params, dst_params)
+        else:
+            resharded_params = params
+            
+        flat_new_params, _ = rl_utils.to_flat_dict(resharded_params)
+        new_params_precision = jax.tree.leaves(flat_new_params)[0].dtype
+        rollout_precision = jax.tree.leaves(self._sampler.transformer_state)[0].dtype
+        
+        if new_params_precision != rollout_precision:
+            flat_new_params = jax.tree.map(
+                lambda x: x.astype(rollout_precision), flat_new_params
+            )
+            
+        flat_old_params, tree_def = rl_utils.to_flat_dict(self._sampler.transformer_state)
+        merged_params = functools.reduce(
+            operator.ior, [flat_old_params, flat_new_params], {}
+        )
+        merged_params = jax.tree.unflatten(tree_def, merged_params.values())
+        new_model = nnx.merge(self._sampler._transformer_graphdef, merged_params)
+        self._sampler.transformer_state = nnx.variables(new_model, nnx.Param)
+
+    def pad_id(self) -> int: return self._pad_id
+    def eos_id(self) -> int: return self._eos_id
+    def model(self) -> Any: return self._model
+    
+    @property
+    def mesh(self): return self._mesh
+
+class CustomVllmRollout(base_rollout.BaseRollout):
+    def __init__(
+        self,
+        *,
+        rollout_actor,
+        tokenizer,
+        mesh,
+        rollout_config,
+    ):
+        from tunix.generate import vllm_sampler
+        from tunix.generate import mappings
+        
+        mapping_config = mappings.MappingConfig.build(
+            mapping_obj=rollout_config.rollout_mapping_config,
+            model=rollout_actor,
+            backend="vllm_jax",
+        )
+        
+        self._model = rollout_actor
+        self._tokenizer = tokenizer
+        self._pad_id = tokenizer.pad_id()
+        self._eos_id = tokenizer.eos_id()
+        
+        max_model_len = getattr(rollout_config, "kv_cache_size", 2048)
+        
+        self._sampler = vllm_sampler.VllmSampler(
+            tokenizer=tokenizer,
+            config=vllm_sampler.VllmConfig(
+                server_mode=rollout_config.rollout_vllm_server_mode,
+                mapping_config=mapping_config,
+                return_logprobs=rollout_config.return_logprobs,
+                init_with_random_weights=rollout_config.rollout_vllm_init_with_random_weights,
+                tpu_backend_type=rollout_config.rollout_vllm_tpu_backend_type,
+                additional_config=rollout_config.rollout_vllm_additional_config,
+                enable_dp_attention=rollout_config.rollout_vllm_enable_dp_attention,
+                hbm_utilization=rollout_config.rollout_vllm_hbm_utilization,
+                lora_config=rollout_config.rollout_vllm_lora_config,
+                mesh=mesh,
+                tensor_parallel_size=rollout_config.tensor_parallel_size,
+                data_parallel_size=rollout_config.data_parallel_size,
+                expert_parallel_size=rollout_config.expert_parallel_size,
+                delete_dst_buffers=rollout_config.rollout_vllm_delete_dst_buffers,
+                reshard_chunk_size=rollout_config.rollout_vllm_reshard_chunk_size,
+                engine_kwargs={
+                    "model": rollout_config.rollout_vllm_model_version,
+                    "max_model_len": max_model_len,
+                    "async_scheduling": rollout_config.rollout_vllm_async_scheduling,
+                    "max_num_batched_tokens": rollout_config.rollout_vllm_max_num_batched_tokens,
+                    "max_num_seqs": rollout_config.rollout_vllm_max_num_seqs,
+                    "hf_config_path": rollout_config.rollout_vllm_hf_config_path,
+                    "max_logprobs": 1,
+                    "logprobs_mode": rollout_config.rollout_vllm_logprobs_mode,
+                    **rollout_config.rollout_vllm_kwargs,
+                },
+                sampling_kwargs=rollout_config.rollout_vllm_sampling_kwargs,
+            ),
+        )
+        state = nnx.state(rollout_actor)
+        self._sampler.load_checkpoint(state)
+        self._mesh = mesh
+
+    @property
+    def mesh(self) -> jax.sharding.Mesh:
+        return self._sampler.mesh
+
+    def generate(
+        self,
+        prompts: list[str],
+        rollout_config: base_rollout.RolloutConfig,
+        **kwargs,
+    ) -> base_rollout.RolloutOutput:
+        self.output = self._sampler(
+            input_strings=prompts,
+            max_generation_steps=rollout_config.max_tokens_to_generate,
+            max_prompt_length=rollout_config.max_prompt_length,
+            temperature=rollout_config.temperature,
+            top_p=rollout_config.top_p,
+            top_k=rollout_config.top_k,
+            seed=rollout_config.seed,
+            echo=False,
+            pad_output=True,
+            **kwargs,
+        )
+
+        return base_rollout.RolloutOutput(
+            text=self.output.text,
+            logits=None,
+            tokens=self.output.tokens,
+            left_padded_prompt_tokens=self.output.padded_prompt_tokens,
+            logprobs=self.output.logprobs,
+        )
+
+    def get_per_token_logps(
+        self,
+        prompt_tokens: jax.Array,
+        completion_tokens: jax.Array,
+        completion_mask: jax.Array | None = None,
+    ) -> jax.Array:
+        return self.output.logprobs
+
+    def update_params(
+        self,
+        params: Any,
+        filter_types: Optional[Tuple[Any, ...]] = None,
+    ) -> None:
+        self._sampler.update_params(params, filter_types)
+
+    def pad_id(self) -> int: return self._pad_id
+    def eos_id(self) -> int: return self._eos_id
+    def model(self) -> Any: return self._model
+
+class CustomGreedyRollout(base_rollout.BaseRollout):
+    def __init__(
+        self,
+        *,
+        rollout_actor,
+        tokenizer,
+        mesh,
+        rollout_config,
+    ):
+        self._model = rollout_actor
+        self._tokenizer = tokenizer
+        self._pad_id = tokenizer.pad_id()
+        self._eos_id = tokenizer.eos_id()
+        self._mesh = mesh
+        self._rollout_config = rollout_config
+
+    def generate(
+        self,
+        prompts: list[str],
+        rollout_config: base_rollout.RolloutConfig,
+        **kwargs,
+    ) -> base_rollout.RolloutOutput:
+        max_new_tokens = rollout_config.max_tokens_to_generate or 128
+        
+        tokens_list = [self._tokenizer.encode(p) for p in prompts]
+        B = len(prompts)
+        
+        # Calculate padded batch size to match TPU mesh multiple
+        multiple = self._mesh.devices.size
+        import math
+        padded_B = int(math.ceil(B / multiple) * multiple)
+        
+        max_prompt_len = max(len(t) for t in tokens_list)
+        max_len = max_prompt_len + max_new_tokens
+        
+        input_ids_np = np.full((padded_B, max_len), self.pad_id(), dtype=np.int32)
+        
+        # Fill actual B prompts
+        for b, tokens in enumerate(tokens_list):
+            length = len(tokens)
+            start_idx = max_prompt_len - length
+            input_ids_np[b, start_idx:max_prompt_len] = tokens
+            
+        # Replicate first prompt to pad the batch from B to padded_B
+        for b in range(B, padded_B):
+            length = len(tokens_list[0])
+            start_idx = max_prompt_len - length
+            input_ids_np[b, start_idx:max_prompt_len] = tokens_list[0]
+            
+        input_ids = jnp.array(input_ids_np)
+        generated_tokens_batch = [[] for _ in range(padded_B)]
+        
+        for step in range(max_prompt_len, max_len):
+            with self._mesh:
+                logits = self._model(input_ids)
+                
+            next_token_logits = logits[:, step - 1, :]
+            next_tokens = jnp.argmax(next_token_logits, axis=-1)
+            next_tokens_np = np.array(next_tokens)
+            
+            # Process only the actual B inputs for outputs
+            for b in range(padded_B):
+                generated_tokens_batch[b].append(int(next_tokens_np[b]))
+                
+            input_ids = input_ids.at[:, step].set(next_tokens)
+            
+        generated_texts = []
+        generated_tokens_list = []
+        # Post-process only the actual B sequences
+        for b in range(B):
+            tokens = generated_tokens_batch[b]
+            truncated_tokens = []
+            for t in tokens:
+                if t == self.eos_id() or t == 128009:
+                    break
+                truncated_tokens.append(t)
+                
+            decoded_text = self._tokenizer.decode(truncated_tokens)
+            generated_texts.append(decoded_text)
+            generated_tokens_list.append(np.array(truncated_tokens, dtype=np.int32))
+            
+        padded_prompt_tokens_list = [input_ids_np[b, :max_prompt_len] for b in range(B)]
+        
+        return base_rollout.RolloutOutput(
+            text=generated_texts,
+            logits=None,
+            tokens=np.array(generated_tokens_list, dtype=object),
+            left_padded_prompt_tokens=np.array(padded_prompt_tokens_list),
+            logprobs=None,
+        )
+
+    def get_per_token_logps(
+        self,
+        prompt_tokens: jax.Array,
+        completion_tokens: jax.Array,
+        completion_mask: jax.Array | None = None,
+    ) -> jax.Array:
+        from tunix.rl import common as rl_common
+        graphdef, state = nnx.split(self._model)
+        return rl_common.compute_per_token_logps(
+            graphdef,
+            state,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            pad_id=self.pad_id(),
+            eos_id=self.eos_id(),
+            completion_mask=completion_mask,
+            stop_gradient=True,
+            return_logits=False,
+        )
+
+    def update_params(
+        self,
+        params: Any,
+        filter_types: Optional[Tuple[Any, ...]] = None,
+    ) -> None:
+        if filter_types is not None:
+            from tunix.rl import reshard as rl_reshard
+            dst_params = nnx.state(self._model, filter_types)
+            resharded_params = rl_reshard.reshard_pytree(params, dst_params)
+        else:
+            resharded_params = params
+        nnx.update(self._model, resharded_params)
+
+    def pad_id(self) -> int: return self._pad_id
+    def eos_id(self) -> int: return self._eos_id
+    def model(self) -> Any: return self._model
+    @property
+    def mesh(self): return self._mesh
+
 def prepare_math_dataset(batch_size: int, tokenizer, dataset_name="nvidia/OpenMathInstruct-1"):
     print(f"Loading {dataset_name} dataset...")
     dataset = load_dataset(dataset_name, split='train', trust_remote_code=True, streaming=True)
@@ -498,18 +872,37 @@ def evaluate_model(rl_cluster, dataset, rollout_config):
     print("lkolluru tokenizer eos_id:", rl_cluster.tokenizer.eos_id())
     print("lkolluru tokenizer bos_id:", rl_cluster.tokenizer.bos_id())
     total_correct, total_samples = 0, 0
-    for batch in dataset.take(4):
-        prompts = [p.decode("utf-8") if isinstance(p, bytes) else str(p) for p in batch["prompts"].numpy()]
-        print("lkolluru prompts: ",prompts)
-        for p in prompts:
-            print("lkolluru tokenized prompt (first 50 tokens):", rl_cluster.tokenizer.encode(p)[:50])
-        ground_truth = [g.decode("utf-8") if isinstance(g, bytes) else str(g) for g in batch["ground_truth"].numpy()]
-        print("lkolluru ground_truth: ",ground_truth)
-        rollout_output = rl_cluster.generate(prompts, rollout_config)
+    for i, batch in enumerate(dataset.take(2)):
+        if i == 0:
+            st="Six positive integers from a list of nine positive integers are $6, 7, 2, 4, 8, 5$. What is the largest possible value of the median of this list of nine positive integers?"
+            sys_p = SYSTEM_PROMPT
+            gt = ['7', '-37']
+        elif i == 1:
+            st="What is the capital of France?"
+            sys_p = "You are a helpful assistant."
+            gt = ['Paris']
+        else:
+            continue
+            
+        formatted_prompt = rl_cluster.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": sys_p},
+                {"role": "user", "content": st},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        batch_size = jax.device_count()
+        prompts = [formatted_prompt] * batch_size
+        print(f"lkolluru prompts (sample {i}, batch size {batch_size}): ", prompts[:1])
+        print("lkolluru tokenized prompt (first 50 tokens):", rl_cluster.tokenizer.encode(prompts[0])[:50])
+        print("lkolluru ground_truth: ", gt)
+        rollout_output = rl_cluster.rollout.generate(prompts, rollout_config)
         completions = rollout_output.text
-        rewards = math_reward_fn(prompts, completions, ground_truth=ground_truth)
-        total_correct += sum(rewards)
-        total_samples += len(rewards)
+        print("lkolluru completion (first of batch): ", completions[0])
+        
+        # We don't calculate rewards for these custom debug samples to avoid math_reward_fn crash on non-math
+        total_samples += 1
     print(f"Accuracy: {total_correct / max(1, total_samples):.4f}")
 
 def main(_):
@@ -533,7 +926,8 @@ def main(_):
     train_ds, test_ds = prepare_math_dataset(global_batch_size, tokenizer)
     
     optimizer = create_custom_optimizer()
-    cluster_config, grpo_config = create_tunix_config(mesh, optimizer, FLAGS.ckpt_dir)
+    model_dir = os.path.join(FLAGS.ckpt_dir, "outputs")
+    cluster_config, grpo_config = create_tunix_config(mesh, optimizer, model_dir)
     
     actor_nnx = AXLearnNNXWrapper(trainer_cfg.model, restored_state.model)
     reference_nnx = AXLearnNNXWrapper(trainer_cfg.model, restored_state.model)
