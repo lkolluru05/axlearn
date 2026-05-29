@@ -54,11 +54,12 @@ from tunix.generate import sampler as tunix_sampler
 import functools
 import operator
 from tunix import MetricsLoggerOptions
+from tunix.sft.metrics_logger import CluBackend, WandbBackend
 from flax import nnx
 from axlearn.common.module import functional as F, install_context_stack
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string("data_dir", "gs://axlearn-public/tensorflow_datasets", "Directory containing the TFDS dataset.")
+flags.DEFINE_string("data_dir", "gs://ericshen-axlearn/tensorflow_datasets", "Directory containing the TFDS dataset.")
 flags.DEFINE_string("ckpt_dir", "gs://ericshen-axlearn/checkpoints/llama-3-1-8B-instruct", "Directory containing the checkpoints.")
 
 # XML Tags for Reasoning
@@ -116,8 +117,25 @@ def extract_predicted_answer(text):
 def math_reward_fn(prompts, completions, **kwargs):
     res = []
     ground_truths = kwargs.get("ground_truth", [])
+    
+    # Robustly flatten the nested ground truths list/array first
+    def flatten_list(item):
+        flat = []
+        def _recurse(x):
+            if hasattr(x, "numpy"): x = x.numpy()
+            if hasattr(x, "tolist"):
+                try: x = x.tolist()
+                except: pass
+            if isinstance(x, (list, tuple)) or (hasattr(x, "shape") and len(x.shape) > 0):
+                for element in x: _recurse(element)
+            else:
+                flat.append(x)
+        _recurse(item)
+        return flat
+
+    ground_truths = flatten_list(ground_truths)
+
     for i, completion in enumerate(completions):
-        print("lkolluru completion: ", completion)
         if len(ground_truths) > 0:
             gt_idx = i if len(ground_truths) == len(completions) else i // max(1, len(completions) // len(ground_truths))
             gt = ground_truths[gt_idx]
@@ -131,9 +149,7 @@ def math_reward_fn(prompts, completions, **kwargs):
         
         expected = extract_math_answer(gt)
         predicted = extract_predicted_answer(completion)
-        print("lkolluru expected value: ", expected)
-        print("lkolluru predicted value: ", predicted)
-        
+        print(f"lkolluru comparison debug: predicted_repr={repr(predicted)}, expected_repr={repr(expected)}, types=({type(predicted)}, {type(expected)}), match={predicted == expected}", flush=True)
         
         if expected and predicted == expected:
             res.append(1.0)
@@ -232,12 +248,13 @@ def create_tunix_config(mesh, optimizer, model_dir: str):
             rl_cluster_lib.Role.ROLLOUT: mesh,
         },
         rollout_engine=CustomGreedyRollout,
+        offload_to_cpu=False,
         training_config=rl_cluster_lib.RLTrainingConfig(
             actor_optimizer=optimizer,
             eval_every_n_steps=10,
             max_steps=100,
-            mini_batch_size=2,
-            train_micro_batch_size=2,
+            mini_batch_size=1,
+            train_micro_batch_size=1,
             metrics_logging_options=MetricsLoggerOptions(log_dir=model_dir),
             checkpoint_root_directory=model_dir,
         ),
@@ -255,6 +272,22 @@ def create_tunix_config(mesh, optimizer, model_dir: str):
     grpo_config = GRPOConfig(num_generations=4, num_iterations=1, beta=0.01, epsilon=0.2)
     return cluster_config, grpo_config
 
+from axlearn.common.optimizers import with_partition_fn, opt_param_values
+from axlearn.common.optimizer_base import PartitionedGradientTransformation
+
+def adafactor_partitioned(learning_rate: float) -> PartitionedGradientTransformation:
+    base = optax.adafactor(learning_rate=learning_rate)
+    
+    def partition_fn(param_specs):
+        dummy_params = jax.tree.map(lambda spec: jnp.zeros(spec.shape, dtype=spec.dtype), param_specs)
+        dummy_state = base.init(opt_param_values(dummy_params))
+        return jax.tree.map(
+            lambda x: OptStateSpec(dtype=x.dtype, shape=x.shape, mesh_axes=PartitionSpec()),
+            dummy_state
+        )
+        
+    return with_partition_fn(base, partition_fn)
+
 def create_custom_optimizer(peak_lr: float = 3e-4, max_step: int = 100):
     update_schedule = config_for_function(cosine_with_linear_warmup).set(
         peak_lr=1.0, max_step=max_step, warmup_steps=50, begin_value=0.0, alpha=0.1
@@ -262,8 +295,8 @@ def create_custom_optimizer(peak_lr: float = 3e-4, max_step: int = 100):
     base_optimizer_cfg = config_for_function(chain).set(
         args=[
             config_for_function(clip_by_global_norm).set(max_norm=1.0),
-            config_for_function(adamw_decoupled_optimizer).set(
-                learning_rate=peak_lr, b1=0.9, b2=0.95, eps=1e-8, update_schedule=update_schedule, weight_decay=0.1
+            config_for_function(adafactor_partitioned).set(
+                learning_rate=peak_lr
             ),
         ]
     )
@@ -338,7 +371,7 @@ class AXLearnNNXWrapper(nnx.Module):
             install_context_stack([])
 
         (_, aux), _ = F(self.ax_model, is_training=is_training, prng_key=jax.random.PRNGKey(42), state=state, inputs=dict(input_batch=input_batch, return_aux=True))
-        outputs = jax.lax.with_sharding_constraint(aux["logits"], jax.sharding.PartitionSpec())
+        outputs = aux["logits"]
         if len(args) > 2 or "cache" in kwargs or "prefill" in kwargs:
             return outputs, cache
         return outputs
@@ -394,7 +427,10 @@ class TunixTokenizerWrapper:
     
     def encode(self, text, *args, **kwargs):
         if hasattr(text, "numpy"): text = text.numpy()
-        if isinstance(text, bytes): text = text.decode('utf-8')
+        if hasattr(text, "decode"):
+            text = text.decode('utf-8', errors='ignore')
+        elif not isinstance(text, str):
+            text = str(text)
         
         special_tokens = {
             "<|begin_of_text|>": 128000,
@@ -719,6 +755,7 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
         self._eos_id = tokenizer.eos_id()
         self._mesh = mesh
         self._rollout_config = rollout_config
+        self._model_def, _ = nnx.split(rollout_actor)
 
     def generate(
         self,
@@ -727,9 +764,30 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
         **kwargs,
     ) -> base_rollout.RolloutOutput:
         max_new_tokens = rollout_config.max_tokens_to_generate or 128
-        
-        tokens_list = [self._tokenizer.encode(p) for p in prompts]
-        B = len(prompts)
+        # 1. Determine the original shape of prompts (e.g. [B, group_size] or [B])
+        original_B = len(prompts)
+        if isinstance(prompts[0], (list, tuple)) or hasattr(prompts[0], "shape"):
+            group_size = len(prompts[0])
+        else:
+            group_size = 1
+            
+        # 2. Recursively flatten any nested lists/arrays of strings into a flat 1D list of strings
+        def flatten_strings(item):
+            flat = []
+            def _recurse(x):
+                if hasattr(x, "numpy"): x = x.numpy()
+                if isinstance(x, bytes): x = x.decode('utf-8')
+                if isinstance(x, (list, tuple)) or (hasattr(x, "shape") and len(x.shape) > 0):
+                    for element in x: _recurse(element)
+                else:
+                    flat.append(str(x))
+            _recurse(item)
+            return flat
+            
+        flat_prompts = flatten_strings(prompts)
+        max_prompt_limit = getattr(self._rollout_config, "max_prompt_length", 512) or 512
+        tokens_list = [self._tokenizer.encode(p)[:max_prompt_limit] for p in flat_prompts]
+        B = len(flat_prompts)  # Total individual prompts count (B * group_size)
         
         # Calculate padded batch size to match TPU mesh multiple
         multiple = self._mesh.devices.size
@@ -738,27 +796,52 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
         
         max_prompt_len = max(len(t) for t in tokens_list)
         max_len = max_prompt_len + max_new_tokens
-        
         input_ids_np = np.full((padded_B, max_len), self.pad_id(), dtype=np.int32)
         
+        def flatten_list(item):
+            flat = []
+            def _recurse(x):
+                if hasattr(x, "numpy"): x = x.numpy()
+                if hasattr(x, "tolist"):
+                    try: x = x.tolist()
+                    except: pass
+                if isinstance(x, (list, tuple)) or (hasattr(x, "shape") and len(x.shape) > 0):
+                    for element in x: _recurse(element)
+                else:
+                    try: flat.append(int(x))
+                    except: pass
+            _recurse(item)
+            return flat
+
         # Fill actual B prompts
         for b, tokens in enumerate(tokens_list):
+            tokens = flatten_list(tokens)
             length = len(tokens)
             start_idx = max_prompt_len - length
             input_ids_np[b, start_idx:max_prompt_len] = tokens
             
         # Replicate first prompt to pad the batch from B to padded_B
         for b in range(B, padded_B):
-            length = len(tokens_list[0])
+            tokens = flatten_list(tokens_list[0])
+            length = len(tokens)
             start_idx = max_prompt_len - length
-            input_ids_np[b, start_idx:max_prompt_len] = tokens_list[0]
+            input_ids_np[b, start_idx:max_prompt_len] = tokens
             
         input_ids = jnp.array(input_ids_np)
         generated_tokens_batch = [[] for _ in range(padded_B)]
         
+        # Extract the current dynamic parameters state PyTree
+        state = nnx.state(self._model)
+        
+        # JIT compile functionally: JAX treats the state/parameters tree as dynamic HBM input buffers (0GB constant overhead!)
+        @jax.jit
+        def forward_step(state, ids):
+            merged_model = nnx.merge(self._model_def, state)
+            return merged_model(ids)
+            
         for step in range(max_prompt_len, max_len):
             with self._mesh:
-                logits = self._model(input_ids)
+                logits = forward_step(state, input_ids)
                 
             next_token_logits = logits[:, step - 1, :]
             next_tokens = jnp.argmax(next_token_logits, axis=-1)
@@ -770,27 +853,27 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
                 
             input_ids = input_ids.at[:, step].set(next_tokens)
             
+        tokens_np = np.full((B, max_new_tokens), self.pad_id(), dtype=np.int32)
         generated_texts = []
-        generated_tokens_list = []
-        # Post-process only the actual B sequences
+        
         for b in range(B):
             tokens = generated_tokens_batch[b]
             truncated_tokens = []
-            for t in tokens:
+            for idx, t in enumerate(tokens):
                 if t == self.eos_id() or t == 128009:
                     break
+                tokens_np[b, idx] = t
                 truncated_tokens.append(t)
                 
             decoded_text = self._tokenizer.decode(truncated_tokens)
             generated_texts.append(decoded_text)
-            generated_tokens_list.append(np.array(truncated_tokens, dtype=np.int32))
             
         padded_prompt_tokens_list = [input_ids_np[b, :max_prompt_len] for b in range(B)]
         
         return base_rollout.RolloutOutput(
             text=generated_texts,
             logits=None,
-            tokens=np.array(generated_tokens_list, dtype=object),
+            tokens=tokens_np,
             left_padded_prompt_tokens=np.array(padded_prompt_tokens_list),
             logprobs=None,
         )
@@ -864,7 +947,7 @@ def prepare_math_dataset(batch_size: int, tokenizer, dataset_name="nvidia/OpenMa
         if is_training: tf_ds = tf_ds.shuffle(1000)
         return tf_ds.batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
-    return to_tf_dataset(dataset.skip(1000), True), to_tf_dataset(dataset.take(1000), False)
+    return to_tf_dataset(dataset.skip(100), True), to_tf_dataset(dataset.take(100), False)
 
 def evaluate_model(rl_cluster, dataset, rollout_config):
     print("Evaluating model...")
@@ -872,73 +955,86 @@ def evaluate_model(rl_cluster, dataset, rollout_config):
     print("lkolluru tokenizer eos_id:", rl_cluster.tokenizer.eos_id())
     print("lkolluru tokenizer bos_id:", rl_cluster.tokenizer.bos_id())
     total_correct, total_samples = 0, 0
-    for i, batch in enumerate(dataset.take(2)):
-        if i == 0:
-            st="Six positive integers from a list of nine positive integers are $6, 7, 2, 4, 8, 5$. What is the largest possible value of the median of this list of nine positive integers?"
-            sys_p = SYSTEM_PROMPT
-            gt = ['7', '-37']
-        elif i == 1:
-            st="What is the capital of France?"
-            sys_p = "You are a helpful assistant."
-            gt = ['Paris']
-        else:
-            continue
-            
-        formatted_prompt = rl_cluster.tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": sys_p},
-                {"role": "user", "content": st},
-            ],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        batch_size = jax.device_count()
-        prompts = [formatted_prompt] * batch_size
-        print(f"lkolluru prompts (sample {i}, batch size {batch_size}): ", prompts[:1])
-        print("lkolluru tokenized prompt (first 50 tokens):", rl_cluster.tokenizer.encode(prompts[0])[:50])
-        print("lkolluru ground_truth: ", gt)
+    for batch in dataset.take(4):
+        prompts = [p.decode("utf-8") if isinstance(p, bytes) else str(p) for p in batch["prompts"].numpy()]
+        print("lkolluru prompts from eval: ", prompts[:1]) # Only print first to avoid log clutter
+        ground_truth = [g.decode("utf-8") if isinstance(g, bytes) else str(g) for g in batch["ground_truth"].numpy()]
+        print("lkolluru ground_truth from eval: ", ground_truth[:1])
+        
         rollout_output = rl_cluster.rollout.generate(prompts, rollout_config)
         completions = rollout_output.text
-        print("lkolluru completion (first of batch): ", completions[0])
+        print("lkolluru completion from eval (first of batch): ", completions[0])
         
-        # We don't calculate rewards for these custom debug samples to avoid math_reward_fn crash on non-math
-        total_samples += 1
+        rewards = math_reward_fn(prompts, completions, ground_truth=ground_truth)
+        total_correct += sum(rewards)
+        total_samples += len(rewards)
     print(f"Accuracy: {total_correct / max(1, total_samples):.4f}")
+
+def custom_wandb_and_console_logger(metrics_buffer):
+    log_dict = {}
+    for metric_name, (values, op) in metrics_buffer.metrics.items():
+        agg_value = np.array(values)
+        if agg_value.size > 0:
+            if op is not None:
+                agg_value = op(agg_value)
+            else:
+                agg_value = np.mean(agg_value)
+            
+            log_dict[f"{metrics_buffer.mode}/{metric_name}"] = float(agg_value)
+            
+    if len(log_dict) > 0:
+        wandb.log(log_dict, step=metrics_buffer.global_steps)
+        if jax.process_index() == 0:
+            print(f"--- Step {metrics_buffer.global_steps} ({metrics_buffer.mode}) ---")
+            for k, v in log_dict.items():
+                print(f"  {k}: {v:.6f}")
 
 def main(_):
     wandb.init()
     trainer_cfg, restored_state, mesh = get_fuji_trainer_and_state(FLAGS.ckpt_dir)
     
-    try:
-        print("Attempting to load native Llama-3 tokenizer using FujiV3Vocabulary...")
-        from axlearn.experiments.text.gpt.vocabulary_fuji_v3 import FujiV3Vocabulary
-        raw_tokenizer = FujiV3Vocabulary(filename="Llama-3-tokenizer.json")
-        print("Successfully loaded native Llama-3 tokenizer!")
-    except Exception as e:
-        print(f"Failed to load native Llama-3 tokenizer ({e}). Falling back to HuggingFace...")
-        from transformers import AutoTokenizer
-        raw_tokenizer = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B-Instruct")
+    print("Forcing TikToken vocabulary alignment using HuggingFace AutoTokenizer...")
+    from transformers import AutoTokenizer
+    raw_tokenizer = AutoTokenizer.from_pretrained("NousResearch/Meta-Llama-3.1-8B-Instruct")
 
     adapter = LlamaTokenizerAdapter(raw_tokenizer)
     tokenizer = TunixTokenizerWrapper(adapter)
     
-    global_batch_size = jax.process_count() * 2
+    global_batch_size = max(16, jax.process_count() * 2)
     train_ds, test_ds = prepare_math_dataset(global_batch_size, tokenizer)
     
     optimizer = create_custom_optimizer()
     model_dir = os.path.join(FLAGS.ckpt_dir, "outputs")
     cluster_config, grpo_config = create_tunix_config(mesh, optimizer, model_dir)
     
-    actor_nnx = AXLearnNNXWrapper(trainer_cfg.model, restored_state.model)
-    reference_nnx = AXLearnNNXWrapper(trainer_cfg.model, restored_state.model)
-    
-    rl_cluster = rl_cluster_lib.RLCluster(actor=actor_nnx, reference=reference_nnx, tokenizer=tokenizer, cluster_config=cluster_config)
+    with mesh:
+        actor_nnx = AXLearnNNXWrapper(trainer_cfg.model, restored_state.model)
+        reference_nnx = AXLearnNNXWrapper(trainer_cfg.model, restored_state.model)
+        
+        rl_cluster = rl_cluster_lib.RLCluster(actor=actor_nnx, reference=reference_nnx, tokenizer=tokenizer, cluster_config=cluster_config)
+        rl_cluster.with_external_metrics_logger(custom_wandb_and_console_logger)
     
     grpo_trainer = GRPOLearner(
         rl_cluster=rl_cluster,
         reward_fns=[math_reward_fn, xml_reward_fn, format_reward_fn],
         algo_config=grpo_config,
     )
+    
+    # Monkey-patch the reward manager's prompts list to duplicate them G times automatically
+    # to bypass the framework length validation check cleanly!
+    original_compute_rewards = grpo_trainer.reward_manager._compute_rewards
+    
+    def patched_compute_rewards(prompts, completions, **kwargs):
+        if len(prompts) != len(completions) and len(completions) % len(prompts) == 0:
+            group_size = len(completions) // len(prompts)
+            # Duplicate prompts list to match completions flat size
+            duplicated_prompts = []
+            for p in prompts:
+                duplicated_prompts.extend([p] * group_size)
+            prompts = duplicated_prompts
+        return original_compute_rewards(prompts, completions, **kwargs)
+        
+    grpo_trainer.reward_manager._compute_rewards = patched_compute_rewards
     
     evaluate_model(rl_cluster, test_ds, cluster_config.rollout_config)
     grpo_trainer.train(train_ds, test_ds)
