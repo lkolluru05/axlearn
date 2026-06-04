@@ -96,7 +96,7 @@ ARG EXTRAS=
 # Ensure we install the TPU version, even if building locally.
 # Jax will fallback to CPU when run on a machine without TPU.
 COPY pyproject.toml README.md /root/
-RUN uv pip install -qq --prerelease=allow .[core,tpu] && uv cache clean
+RUN uv pip install -qq --prerelease=allow .[core,tpu,dev] && uv cache clean
 RUN if [ -n "$EXTRAS" ]; then uv pip install -qq .[$EXTRAS] && uv cache clean; fi
 COPY . .
 

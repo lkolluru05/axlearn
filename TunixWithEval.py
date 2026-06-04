@@ -94,7 +94,7 @@ def extract_math_answer(text):
 
 def extract_predicted_answer(text):
     """Extract answer from model output, prioritizing <answer> tags then \boxed{}."""
-    print("lkolluru predicted text: ", text)
+    print("lkolluru predicted text: ", repr(text))
     if not isinstance(text, str):
         text = str(text)
     
@@ -251,7 +251,7 @@ def create_tunix_config(mesh, optimizer, model_dir: str):
         offload_to_cpu=False,
         training_config=rl_cluster_lib.RLTrainingConfig(
             actor_optimizer=optimizer,
-            eval_every_n_steps=10,
+            eval_every_n_steps=100,
             max_steps=100,
             mini_batch_size=1,
             train_micro_batch_size=1,
@@ -352,29 +352,98 @@ class AXLearnNNXWrapper(nnx.Module):
         self.ax_model = model_cfg.set(name="model").instantiate(parent=None)
         self.params = nnx.data(jax.tree.map(nnx.Param, params))
         self.config = TunixConfigWrapper(self.ax_model)
-        flat_params = jax.tree.leaves(params)
-        means = [float(jnp.mean(p)) for p in flat_params]
-        stds = [float(jnp.std(p)) for p in flat_params]
-        has_nan = any(np.isnan(m) or np.isnan(s) for m, s in zip(means, stds))
-        print("lkolluru global param stats: mean =", np.mean(means), "std =", np.mean(stds), "has_nan =", has_nan)
 
     def __call__(self, *args, **kwargs):
         input_ids = args[0] if len(args) > 0 else kwargs.get("input_batch", kwargs.get("input_ids"))
         cache = args[2] if len(args) > 2 else kwargs.get("cache")
         is_training = kwargs.get("is_training", False)
-        
-        input_batch = {"input_ids": input_ids} if not isinstance(input_ids, dict) else input_ids
-        state = jax.tree.map(lambda p: getattr(p, "value", p) if isinstance(p, nnx.Variable) else p, self.params)
-        
+
+        if isinstance(input_ids, dict):
+            input_ids = input_ids["input_ids"]
+
+        # Extract the current parameters/state PyTree
+        state = jax.tree.map(
+            lambda p: (
+                getattr(p, "_raw_value", getattr(p, "value", p))
+                if isinstance(p, nnx.Variable)
+                else p
+            ),
+            self.params,
+            is_leaf=lambda x: isinstance(x, nnx.Variable),
+        )
+
+        # Ensure the functional call context stack is active
         from axlearn.common.module import _global_context_stack
         if getattr(_global_context_stack, "thread_id", None) != threading.get_ident():
             install_context_stack([])
 
-        (_, aux), _ = F(self.ax_model, is_training=is_training, prng_key=jax.random.PRNGKey(42), state=state, inputs=dict(input_batch=input_batch, return_aux=True))
-        outputs = aux["logits"]
-        if len(args) > 2 or "cache" in kwargs or "prefill" in kwargs:
-            return outputs, cache
-        return outputs
+        # Check if we are in prefill (seq_len > 1) or incremental decode (seq_len == 1)
+        seq_len = input_ids.shape[-1]
+
+        if seq_len > 1:
+            # Prefill Step:
+            # 1. Calculate prompt lengths (non-padding tokens)
+            # Dynamically detect the pad token ID by checking the repeating token at the start of left-padding
+            model_pad_id = self.ax_model.decoder.config.pad_token_id
+            is_padded = (input_ids[0, 0] == input_ids[0, 1])
+            pad_id = jnp.where(is_padded, input_ids[0, 0], model_pad_id)
+            
+            # Map/replace all input padding tokens to the model-expected pad token ID so the decoder can mask them
+            input_ids = jnp.where(input_ids == pad_id, model_pad_id, input_ids)
+                
+            non_pad_mask = (input_ids != model_pad_id)
+            prompt_lengths = jnp.sum(non_pad_mask, axis=-1, dtype=jnp.int32)
+            
+            # 2. Convert Left-Padding to Right-Padding (required by AxLearn Decoder)
+            # Sort mask so True (non-padding) comes first, then False (padding)
+            sort_idx = jnp.argsort(~non_pad_mask, axis=-1, stable=True)
+            right_padded_ids = jnp.take_along_axis(input_ids, sort_idx, axis=-1)
+            
+            # 3. Create input batch for decoder
+            input_batch = {
+                "input_ids": right_padded_ids,
+            }
+            
+            # Invoke prefill_states functionally on the decoder sub-module
+            # Passing prompt_lengths as time_step correctly initializes the KV cache pointers
+            (updated_cache, outputs), _ = F(
+                module=self.ax_model.decoder,
+                inputs=dict(time_step=prompt_lengths, input_batch=input_batch),
+                is_training=is_training,
+                prng_key=jax.random.PRNGKey(42),
+                state=state["decoder"],
+                method="prefill_states",
+            )
+
+            # Slice the computed logits back to the sampler's static shape (seq_len)
+            logits = outputs["logits"][:, :seq_len]
+            
+            # 4. Un-shift the sliced logits back to the original left-padded layout
+            inv_sort_idx = jnp.argsort(sort_idx, axis=-1, stable=True)
+            logits = jnp.take_along_axis(logits, jnp.expand_dims(inv_sort_idx, -1), axis=1)
+            logits = jax.lax.with_sharding_constraint(logits, jax.sharding.PartitionSpec())
+            return logits, updated_cache
+
+        else:
+            # Incremental Decode Step:
+            # Invoke extend_step functionally on the decoder sub-module
+            print("In seq_len == 1 mode")
+            input_batch = {
+                "input_ids": input_ids,
+            }
+            (updated_cache, outputs), _ = F(
+                module=self.ax_model.decoder,
+                inputs=dict(cached_states=cache, input_batch=input_batch),
+                is_training=is_training,
+                prng_key=jax.random.PRNGKey(42),
+                state=state["decoder"],
+                method="extend_step",
+            )
+            
+            # Extract logits for the single step
+            logits = outputs["logits"]
+            logits = jax.lax.with_sharding_constraint(logits, jax.sharding.PartitionSpec())
+            return logits, updated_cache
 
 class LlamaTokenizerAdapter:
     def __init__(self, tokenizer_or_vocab):
@@ -757,6 +826,13 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
         self._rollout_config = rollout_config
         self._model_def, _ = nnx.split(rollout_actor)
 
+        # JIT compile functionally once to prevent recompilation on every call.
+        @jax.jit
+        def forward_step(state, cache, ids):
+            merged_model = nnx.merge(self._model_def, state)
+            return merged_model(ids, cache=cache)
+        self._forward_step = forward_step
+
     def generate(
         self,
         prompts: list[str],
@@ -785,18 +861,23 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
             return flat
             
         flat_prompts = flatten_strings(prompts)
+        print(f"Flattened prompts count: {len(flat_prompts)}")
+        print(f"First flattened prompt: {repr(flat_prompts[0])}")
         max_prompt_limit = getattr(self._rollout_config, "max_prompt_length", 512) or 512
         tokens_list = [self._tokenizer.encode(p)[:max_prompt_limit] for p in flat_prompts]
         B = len(flat_prompts)  # Total individual prompts count (B * group_size)
+        print(f"Tokenized {B} prompts. First token list length: {len(tokens_list[0])}")
         
         # Calculate padded batch size to match TPU mesh multiple
         multiple = self._mesh.devices.size
         import math
         padded_B = int(math.ceil(B / multiple) * multiple)
+        print(f"Batch size: {B}, Padded batch size: {padded_B} (mesh multiple: {multiple})")
         
-        max_prompt_len = max(len(t) for t in tokens_list)
+        max_prompt_len = max_prompt_limit
         max_len = max_prompt_len + max_new_tokens
         input_ids_np = np.full((padded_B, max_len), self.pad_id(), dtype=np.int32)
+        print(f"Created input_ids_np with shape: {input_ids_np.shape}")
         
         def flatten_list(item):
             flat = []
@@ -813,53 +894,75 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
             _recurse(item)
             return flat
 
-        # Fill actual B prompts
+        # 5. Build Prefill input_ids and paddings (0 = valid, 1 = padded)
+        prefill_ids_np = np.full((padded_B, max_prompt_len), self.pad_id(), dtype=np.int32)
+        prefill_paddings_np = np.ones((padded_B, max_prompt_len), dtype=np.int32)
+        
         for b, tokens in enumerate(tokens_list):
             tokens = flatten_list(tokens)
             length = len(tokens)
             start_idx = max_prompt_len - length
-            input_ids_np[b, start_idx:max_prompt_len] = tokens
+            prefill_ids_np[b, start_idx:max_prompt_len] = tokens
+            prefill_paddings_np[b, start_idx:max_prompt_len] = 0
             
         # Replicate first prompt to pad the batch from B to padded_B
         for b in range(B, padded_B):
             tokens = flatten_list(tokens_list[0])
             length = len(tokens)
             start_idx = max_prompt_len - length
-            input_ids_np[b, start_idx:max_prompt_len] = tokens
+            prefill_ids_np[b, start_idx:max_prompt_len] = tokens
+            prefill_paddings_np[b, start_idx:max_prompt_len] = 0
             
-        input_ids = jnp.array(input_ids_np)
+        prefill_ids = jnp.array(prefill_ids_np)
+        prefill_paddings = jnp.array(prefill_paddings_np)
+        
         generated_tokens_batch = [[] for _ in range(padded_B)]
-        
-        # Extract the current dynamic parameters state PyTree
         state = nnx.state(self._model)
+        cache = None
         
-        # JIT compile functionally: JAX treats the state/parameters tree as dynamic HBM input buffers (0GB constant overhead!)
-        @jax.jit
-        def forward_step(state, ids):
-            merged_model = nnx.merge(self._model_def, state)
-            return merged_model(ids)
+        # 6. Prefill Phase: processes the full prompt length at once to compute initial cache
+        prefill_batch = {
+            "input_ids": prefill_ids,
+            "paddings": prefill_paddings,
+        }
+        with self._mesh:
+            logits, cache = self._forward_step(state, cache, prefill_batch)
             
-        for step in range(max_prompt_len, max_len):
+        # Extract the first generated tokens from the last logit of the prefill phase
+        next_token_logits = jax.block_until_ready(logits[:, -1, :])
+        next_tokens = jax.block_until_ready(jnp.argmax(next_token_logits, axis=-1))
+        next_tokens_np = np.array(next_tokens)
+        
+        for b in range(padded_B):
+            generated_tokens_batch[b].append(int(next_tokens_np[b]))
+            
+        # 7. Decode Phase: step-by-step decoding with single token inputs
+        curr_tokens = jnp.expand_dims(next_tokens, axis=-1)  # Shape: (padded_B, 1)
+        decode_paddings = jnp.zeros((padded_B, 1), dtype=np.int32)
+        
+        for step in range(1, max_new_tokens):
+            decode_batch = {
+                "input_ids": curr_tokens,
+                "paddings": decode_paddings,
+            }
             with self._mesh:
-                logits = forward_step(state, input_ids)
+                logits, cache = self._forward_step(state, cache, decode_batch)
                 
-            next_token_logits = logits[:, step - 1, :]
+            next_token_logits = logits[:, 0, :]
             next_tokens = jnp.argmax(next_token_logits, axis=-1)
             next_tokens_np = np.array(next_tokens)
             
-            # Process only the actual B inputs for outputs
             for b in range(padded_B):
                 generated_tokens_batch[b].append(int(next_tokens_np[b]))
                 
-            input_ids = input_ids.at[:, step].set(next_tokens)
+            curr_tokens = jnp.expand_dims(next_tokens, axis=-1)
             
         tokens_np = np.full((B, max_new_tokens), self.pad_id(), dtype=np.int32)
         generated_texts = []
         
         for b in range(B):
-            tokens = generated_tokens_batch[b]
             truncated_tokens = []
-            for idx, t in enumerate(tokens):
+            for idx, t in enumerate(generated_tokens_batch[b]):
                 if t == self.eos_id() or t == 128009:
                     break
                 tokens_np[b, idx] = t
@@ -868,7 +971,7 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
             decoded_text = self._tokenizer.decode(truncated_tokens)
             generated_texts.append(decoded_text)
             
-        padded_prompt_tokens_list = [input_ids_np[b, :max_prompt_len] for b in range(B)]
+        padded_prompt_tokens_list = [prefill_ids_np[b, :max_prompt_len] for b in range(B)]
         
         return base_rollout.RolloutOutput(
             text=generated_texts,
@@ -947,7 +1050,11 @@ def prepare_math_dataset(batch_size: int, tokenizer, dataset_name="nvidia/OpenMa
         if is_training: tf_ds = tf_ds.shuffle(1000)
         return tf_ds.batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
-    return to_tf_dataset(dataset.skip(100), True), to_tf_dataset(dataset.take(100), False)
+    # Use a very small number of examples for quick training and evaluation
+    eval_dataset = dataset.take(16)
+    train_dataset = dataset.skip(16).take(32)
+    
+    return to_tf_dataset(train_dataset, True), to_tf_dataset(eval_dataset, False)
 
 def evaluate_model(rl_cluster, dataset, rollout_config):
     print("Evaluating model...")
@@ -963,7 +1070,7 @@ def evaluate_model(rl_cluster, dataset, rollout_config):
         
         rollout_output = rl_cluster.rollout.generate(prompts, rollout_config)
         completions = rollout_output.text
-        print("lkolluru completion from eval (first of batch): ", completions[0])
+        print("lkolluru completion from eval (first of batch): ", repr(completions[0]))
         
         rewards = math_reward_fn(prompts, completions, ground_truth=ground_truth)
         total_correct += sum(rewards)
@@ -985,7 +1092,8 @@ def custom_wandb_and_console_logger(metrics_buffer):
     if len(log_dict) > 0:
         wandb.log(log_dict, step=metrics_buffer.global_steps)
         if jax.process_index() == 0:
-            print(f"--- Step {metrics_buffer.global_steps} ({metrics_buffer.mode}) ---")
+            pct = (metrics_buffer.global_steps / max(1, metrics_buffer.max_global_steps if hasattr(metrics_buffer, "max_global_steps") else 100)) * 100
+            print(f"Actor Training: {pct:.1f}% | Step {metrics_buffer.global_steps} ({metrics_buffer.mode})")
             for k, v in log_dict.items():
                 print(f"  {k}: {v:.6f}")
 
@@ -1004,7 +1112,7 @@ def main(_):
     train_ds, test_ds = prepare_math_dataset(global_batch_size, tokenizer)
     
     optimizer = create_custom_optimizer()
-    model_dir = os.path.join(FLAGS.ckpt_dir, "outputs")
+    model_dir = os.path.join(FLAGS.ckpt_dir, "rloutputs")
     cluster_config, grpo_config = create_tunix_config(mesh, optimizer, model_dir)
     
     with mesh:
@@ -1027,16 +1135,41 @@ def main(_):
     def patched_compute_rewards(prompts, completions, **kwargs):
         if len(prompts) != len(completions) and len(completions) % len(prompts) == 0:
             group_size = len(completions) // len(prompts)
-            # Duplicate prompts list to match completions flat size
             duplicated_prompts = []
             for p in prompts:
                 duplicated_prompts.extend([p] * group_size)
             prompts = duplicated_prompts
-        return original_compute_rewards(prompts, completions, **kwargs)
+            
+        m_rewards = math_reward_fn(prompts, completions, **kwargs)
+        x_rewards = xml_reward_fn(prompts, completions, **kwargs)
+        f_rewards = format_reward_fn(prompts, completions, **kwargs)
+
+        m_arr = np.array(m_rewards, dtype=np.float32)
+        x_arr = np.array(x_rewards, dtype=np.float32)
+        f_arr = np.array(f_rewards, dtype=np.float32)
+        total_arr = m_arr + x_arr + f_arr
+
+        print(f"Explicit Math Reward Mean: {np.mean(m_arr):.4f} (Sum: {np.sum(m_arr)})", flush=True)
+        print(f"Explicit XML Reward Mean: {np.mean(x_arr):.4f}, Format: {np.mean(f_arr):.4f}", flush=True)
+
+        log_metrics = {
+            "rewards/math_reward_fn": (float(np.mean(m_arr)), None),
+            "rewards/xml_reward_fn": (float(np.mean(x_arr)), None),
+            "rewards/format_reward_fn": (float(np.mean(f_arr)), None),
+            "rewards/sum": (float(np.mean(total_arr)), None),
+        }
+
+        if hasattr(grpo_trainer.reward_manager, "metrics"):
+            grpo_trainer.reward_manager.metrics.update(log_metrics)
+
+        return {
+            "rewards": jnp.array(total_arr, dtype=jnp.float32),
+            "log_metrics": log_metrics,
+        }
         
     grpo_trainer.reward_manager._compute_rewards = patched_compute_rewards
     
-    evaluate_model(rl_cluster, test_ds, cluster_config.rollout_config)
+    #evaluate_model(rl_cluster, test_ds, cluster_config.rollout_config)
     grpo_trainer.train(train_ds, test_ds)
     evaluate_model(rl_cluster, test_ds, cluster_config.rollout_config)
     wandb.finish()
