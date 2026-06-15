@@ -13,6 +13,7 @@ subprocess.run(
  check=False
 )
 
+
 # --- HOT-PATCH FOR KAGGLESDK BUG ---
 # Fixes ImportError: cannot import name 'get_web_endpoint' from 'kagglesdk.kaggle_env'
 try:
@@ -24,6 +25,8 @@ except ImportError:
 
 import tensorflow as tf
 from absl import app, flags
+import logging
+from absl import logging as absl_logging
 from axlearn.common import input_tf_data
 from axlearn.common.config import config_for_class, config_for_function
 import jax
@@ -43,7 +46,9 @@ from axlearn.common.schedule import cosine_with_linear_warmup
 from axlearn.common.optimizer_base import OptParam
 from datasets import load_dataset
 import optax
+import orbax.checkpoint as ocp
 import wandb
+from metrax.logging import TensorboardBackend
 import numpy as np
 
 # Tunix imports
@@ -73,10 +78,13 @@ provide your reasoning. Place it between {reasoning_start} and \
 {reasoning_end}. Then, provide the final answer (i.e., just one numerical \
 value) between {solution_start} and {solution_end}."""
 
-if "WANDB_API_KEY" in os.environ and os.environ["WANDB_API_KEY"]:
-    wandb.login(key=os.environ["WANDB_API_KEY"])
-else:
-    print("WANDB_API_KEY not found. Skipping wandb login.")
+# if "WANDB_API_KEY" in os.environ and os.environ["WANDB_API_KEY"]:
+#     wandb.login(key=os.environ["WANDB_API_KEY"])
+# else:
+#     print("WANDB_API_KEY not found. Skipping wandb login.")
+
+
+# wandb.init()
 
 def extract_math_answer(text):
     """Robustly extract answer from ground truth, handling #### and \boxed{}."""
@@ -206,26 +214,32 @@ def get_fuji_trainer_and_state(ckpt_dir: str):
         )
 
         has_learner = False
-        if jax.process_index() == 0:
-            try:
-                from axlearn.common.checkpointer import read_index_file
-                latest_ckpt = Checkpointer.latest_checkpoint_path(ckpt_dir)
+        try:
+            from axlearn.common.checkpointer import read_index_file
+            latest_ckpt = Checkpointer.latest_checkpoint_path(ckpt_dir)
+            if latest_ckpt is not None:
                 index = read_index_file(latest_ckpt)
                 has_learner = any(p.startswith("learner") for p, _ in index)
-            except Exception as e:
-                print(f"Process 0 failed to read checkpoint index: {e}")
-                has_learner = False
-
-        has_learner_arr = jnp.array(1 if has_learner else 0, dtype=jnp.int32)
-        has_learner = multihost_utils.broadcast_one_to_all(has_learner_arr).item() == 1
-
-        restore_state_specs = trainer_state_specs._asdict() if has_learner else {"model": model_param_specs}
-        step, restored_state_dict = checkpointer.restore(step=None, state=restore_state_specs)
-        print("lkolluru checkpoint restored step:", step)
+        except Exception as e:
+            print(f"Failed to read checkpoint index: {e}")
+            has_learner = False
 
         prng_key = jax.random.PRNGKey(0)
-        if step is None:
-            restored_state_dict["model"] = model.initialize_parameters_recursively(prng_key=prng_key)
+        # 1. Initialize actual sharded JAX arrays to ensure the checkpointer shards the weights properly.
+        sharded_model_params = model.initialize_parameters_recursively(prng_key=prng_key)
+        
+        restore_state = {"model": sharded_model_params}
+        if has_learner:
+            opt_params = jax.tree.map(
+                lambda p, spec: OptParam(value=p, factorization_spec=getattr(spec, "factorization", None), weight_decay_scale=getattr(spec, "weight_decay_scale", 1.0)),
+                sharded_model_params, model_param_specs
+            )
+            restore_state["learner"] = learner.init(opt_params)
+            restore_state["prng_key"] = prng_key
+
+        # 2. Restore disk checkpoint directly into the sharded arrays
+        step, restored_state_dict = checkpointer.restore(step=None, state=restore_state)
+        print("lkolluru checkpoint restored step:", step)
 
         if "learner" not in restored_state_dict:
             opt_params = jax.tree.map(
@@ -251,12 +265,20 @@ def create_tunix_config(mesh, optimizer, model_dir: str):
         offload_to_cpu=False,
         training_config=rl_cluster_lib.RLTrainingConfig(
             actor_optimizer=optimizer,
-            eval_every_n_steps=100,
-            max_steps=100,
+            eval_every_n_steps=50,
+            max_steps=50,
             mini_batch_size=1,
             train_micro_batch_size=1,
-            metrics_logging_options=MetricsLoggerOptions(log_dir=model_dir),
+            metrics_logging_options=MetricsLoggerOptions(
+                log_dir=model_dir,
+                # backend_kwargs={
+                #     "custom_backend": [lambda: TensorboardBackend(log_dir=model_dir)]
+                # },
+            ),
             checkpoint_root_directory=model_dir,
+            checkpointing_options=ocp.CheckpointManagerOptions(
+                enable_async_checkpointing=False
+            ),
         ),
         rollout_config=base_rollout.RolloutConfig(
             max_tokens_to_generate=512,
@@ -272,22 +294,6 @@ def create_tunix_config(mesh, optimizer, model_dir: str):
     grpo_config = GRPOConfig(num_generations=4, num_iterations=1, beta=0.01, epsilon=0.2)
     return cluster_config, grpo_config
 
-from axlearn.common.optimizers import with_partition_fn, opt_param_values
-from axlearn.common.optimizer_base import PartitionedGradientTransformation
-
-def adafactor_partitioned(learning_rate: float) -> PartitionedGradientTransformation:
-    base = optax.adafactor(learning_rate=learning_rate)
-    
-    def partition_fn(param_specs):
-        dummy_params = jax.tree.map(lambda spec: jnp.zeros(spec.shape, dtype=spec.dtype), param_specs)
-        dummy_state = base.init(opt_param_values(dummy_params))
-        return jax.tree.map(
-            lambda x: OptStateSpec(dtype=x.dtype, shape=x.shape, mesh_axes=PartitionSpec()),
-            dummy_state
-        )
-        
-    return with_partition_fn(base, partition_fn)
-
 def create_custom_optimizer(peak_lr: float = 3e-4, max_step: int = 100):
     update_schedule = config_for_function(cosine_with_linear_warmup).set(
         peak_lr=1.0, max_step=max_step, warmup_steps=50, begin_value=0.0, alpha=0.1
@@ -295,8 +301,13 @@ def create_custom_optimizer(peak_lr: float = 3e-4, max_step: int = 100):
     base_optimizer_cfg = config_for_function(chain).set(
         args=[
             config_for_function(clip_by_global_norm).set(max_norm=1.0),
-            config_for_function(adafactor_partitioned).set(
-                learning_rate=peak_lr
+            config_for_function(adamw_decoupled_optimizer).set(
+                learning_rate=peak_lr,
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=0.01,
+                update_schedule=update_schedule,
             ),
         ]
     )
@@ -377,6 +388,32 @@ class AXLearnNNXWrapper(nnx.Module):
         if getattr(_global_context_stack, "thread_id", None) != threading.get_ident():
             install_context_stack([])
 
+        is_generation = "cache" in kwargs or len(args) > 2
+        if not is_generation:
+            print("Not generatiion cache")
+            # Standard Training / Logprobs Forward Pass (No KV Cache Allocation)
+            # Bypassing prefill_states prevents XLA from allocating the massive 8192-token KV cache 
+            # and saving massive activations during the PPO backward pass, saving >20GB of HBM.
+            input_batch = {"input_ids": input_ids}
+            original_input = args[0] if len(args) > 0 else kwargs.get("input_batch", kwargs.get("input_ids"))
+            if isinstance(original_input, dict) and "paddings" in original_input:
+                input_batch["paddings"] = original_input["paddings"]
+
+            state_dict = {"params": state["decoder"]}
+            
+            # Call decoder directly to prevent auto-shifting of input_ids by the causal_lm Model wrapper
+            (features, aux), output_collection = F(
+                self.ax_model.decoder,
+                input_batch,
+                return_aux=True,
+                is_training=is_training,
+                prng_key=jax.random.PRNGKey(42),
+                state=state_dict,
+            )
+            from jax.sharding import PartitionSpec as P
+            # Shard sequence dimension over FSDP to avoid replication OOMs when batch_size < fsdp size
+            return jax.lax.with_sharding_constraint(aux["logits"], P(None, ("data", "expert", "fsdp"), None))
+
         # Check if we are in prefill (seq_len > 1) or incremental decode (seq_len == 1)
         seq_len = input_ids.shape[-1]
 
@@ -420,8 +457,21 @@ class AXLearnNNXWrapper(nnx.Module):
             
             # 4. Un-shift the sliced logits back to the original left-padded layout
             inv_sort_idx = jnp.argsort(sort_idx, axis=-1, stable=True)
-            logits = jnp.take_along_axis(logits, jnp.expand_dims(inv_sort_idx, -1), axis=1)
-            logits = jax.lax.with_sharding_constraint(logits, jax.sharding.PartitionSpec())
+            # Efficiently gather using vmap to prevent massive broadcast OOMs
+            logits = jax.vmap(lambda l, i: l[i])(logits, inv_sort_idx)
+            
+            from jax.sharding import PartitionSpec as P
+            logits = jax.lax.with_sharding_constraint(logits, P(("data", "expert", "fsdp"), None, None))
+            
+            # Fix time_step in cache and explicitly shard the cache to prevent massive replication OOM
+            def _fix_and_shard_cache(x):
+                if getattr(x, "shape", None) == prompt_lengths.shape and getattr(x, "dtype", None) == jnp.int32:
+                    return prompt_lengths
+                if hasattr(x, "shape") and len(x.shape) >= 4:
+                    return jax.lax.with_sharding_constraint(x, P(("data", "expert", "fsdp"), None, None, None))
+                return x
+            updated_cache = jax.tree_util.tree_map(_fix_and_shard_cache, updated_cache)
+            
             return logits, updated_cache
 
         else:
@@ -442,8 +492,17 @@ class AXLearnNNXWrapper(nnx.Module):
             
             # Extract logits for the single step
             logits = outputs["logits"]
-            logits = jax.lax.with_sharding_constraint(logits, jax.sharding.PartitionSpec())
+            from jax.sharding import PartitionSpec as P
+            logits = jax.lax.with_sharding_constraint(logits, P(("data", "expert", "fsdp"), None, None))
+            
+            def _shard_cache(x):
+                if hasattr(x, "shape") and len(x.shape) >= 4:
+                    return jax.lax.with_sharding_constraint(x, P(("data", "expert", "fsdp"), None, None, None))
+                return x
+            updated_cache = jax.tree_util.tree_map(_shard_cache, updated_cache)
+            
             return logits, updated_cache
+
 
 class LlamaTokenizerAdapter:
     def __init__(self, tokenizer_or_vocab):
@@ -913,8 +972,11 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
             prefill_ids_np[b, start_idx:max_prompt_len] = tokens
             prefill_paddings_np[b, start_idx:max_prompt_len] = 0
             
-        prefill_ids = jnp.array(prefill_ids_np)
-        prefill_paddings = jnp.array(prefill_paddings_np)
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        batch_sharding = NamedSharding(self._mesh, P(("data", "expert", "fsdp"), None))
+        
+        prefill_ids = jax.device_put(prefill_ids_np, batch_sharding)
+        prefill_paddings = jax.device_put(prefill_paddings_np, batch_sharding)
         
         generated_tokens_batch = [[] for _ in range(padded_B)]
         state = nnx.state(self._model)
@@ -929,16 +991,16 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
             logits, cache = self._forward_step(state, cache, prefill_batch)
             
         # Extract the first generated tokens from the last logit of the prefill phase
-        next_token_logits = jax.block_until_ready(logits[:, -1, :])
-        next_tokens = jax.block_until_ready(jnp.argmax(next_token_logits, axis=-1))
+        next_token_logits = logits[:, -1, :]
+        next_tokens = jnp.argmax(next_token_logits, axis=-1)
         next_tokens_np = np.array(next_tokens)
         
         for b in range(padded_B):
             generated_tokens_batch[b].append(int(next_tokens_np[b]))
             
         # 7. Decode Phase: step-by-step decoding with single token inputs
-        curr_tokens = jnp.expand_dims(next_tokens, axis=-1)  # Shape: (padded_B, 1)
-        decode_paddings = jnp.zeros((padded_B, 1), dtype=np.int32)
+        curr_tokens = jax.device_put(jnp.expand_dims(next_tokens, axis=-1), batch_sharding)
+        decode_paddings = jax.device_put(jnp.zeros((padded_B, 1), dtype=jnp.int32), batch_sharding)
         
         for step in range(1, max_new_tokens):
             decode_batch = {
@@ -955,7 +1017,7 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
             for b in range(padded_B):
                 generated_tokens_batch[b].append(int(next_tokens_np[b]))
                 
-            curr_tokens = jnp.expand_dims(next_tokens, axis=-1)
+            curr_tokens = jax.device_put(jnp.expand_dims(next_tokens, axis=-1), batch_sharding)
             
         tokens_np = np.full((B, max_new_tokens), self.pad_id(), dtype=np.int32)
         generated_texts = []
@@ -1022,7 +1084,7 @@ class CustomGreedyRollout(base_rollout.BaseRollout):
 
 def prepare_math_dataset(batch_size: int, tokenizer, dataset_name="nvidia/OpenMathInstruct-1"):
     print(f"Loading {dataset_name} dataset...")
-    dataset = load_dataset(dataset_name, split='train', trust_remote_code=True, streaming=True)
+    dataset = load_dataset(dataset_name, split='train', streaming=True)
     dataset = dataset.shuffle(buffer_size=10000, seed=42)
     
     def format_example(example):
@@ -1050,13 +1112,13 @@ def prepare_math_dataset(batch_size: int, tokenizer, dataset_name="nvidia/OpenMa
         if is_training: tf_ds = tf_ds.shuffle(1000)
         return tf_ds.batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
 
-    # Use a very small number of examples for quick training and evaluation
     eval_dataset = dataset.take(16)
-    train_dataset = dataset.skip(16).take(32)
+    train_dataset = dataset.skip(16).take(5000)
     
     return to_tf_dataset(train_dataset, True), to_tf_dataset(eval_dataset, False)
 
 def evaluate_model(rl_cluster, dataset, rollout_config):
+    wandb.init()
     print("Evaluating model...")
     print("lkolluru tokenizer pad_id:", rl_cluster.tokenizer.pad_id())
     print("lkolluru tokenizer eos_id:", rl_cluster.tokenizer.eos_id())
@@ -1078,10 +1140,14 @@ def evaluate_model(rl_cluster, dataset, rollout_config):
     print(f"Accuracy: {total_correct / max(1, total_samples):.4f}")
 
 def custom_wandb_and_console_logger(metrics_buffer):
+    wandb.init()
     log_dict = {}
     for metric_name, (values, op) in metrics_buffer.metrics.items():
         agg_value = np.array(values)
         if agg_value.size > 0:
+            # Gracefully skip attempting numerical reduction on string arrays
+            if agg_value.dtype.kind in {"U", "S"} or (agg_value.dtype.kind == "O" and isinstance(agg_value.ravel()[0], (str, np.str_))):
+                continue
             if op is not None:
                 agg_value = op(agg_value)
             else:
@@ -1098,8 +1164,30 @@ def custom_wandb_and_console_logger(metrics_buffer):
                 print(f"  {k}: {v:.6f}")
 
 def main(_):
+    absl_logging.use_python_logging()
+
+    # 2. Configure the root logger
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+    # 3. Explicitly set levels for relevant loggers
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("absl").setLevel(logging.INFO)
+
+    # 4. Set absl verbosity
+    absl_logging.set_verbosity(absl_logging.INFO)
+    absl_logging.set_stderrthreshold("info")
+
     wandb.init()
     trainer_cfg, restored_state, mesh = get_fuji_trainer_and_state(FLAGS.ckpt_dir)
+    print("lkolluru mesh shape:", getattr(trainer_cfg, "mesh_shape", None), flush=True)
+    print("lkolluru mesh axis names:", getattr(trainer_cfg, "mesh_axis_names", None), flush=True)
+    print("lkolluru mesh:", mesh, flush=True)
     
     print("Forcing TikToken vocabulary alignment using HuggingFace AutoTokenizer...")
     from transformers import AutoTokenizer
@@ -1112,7 +1200,7 @@ def main(_):
     train_ds, test_ds = prepare_math_dataset(global_batch_size, tokenizer)
     
     optimizer = create_custom_optimizer()
-    model_dir = os.path.join(FLAGS.ckpt_dir, "rloutputs")
+    model_dir = os.path.join(FLAGS.ckpt_dir, "rloutputs_moretests2")
     cluster_config, grpo_config = create_tunix_config(mesh, optimizer, model_dir)
     
     with mesh:
@@ -1121,6 +1209,28 @@ def main(_):
         
         rl_cluster = rl_cluster_lib.RLCluster(actor=actor_nnx, reference=reference_nnx, tokenizer=tokenizer, cluster_config=cluster_config)
         rl_cluster.with_external_metrics_logger(custom_wandb_and_console_logger)
+        
+        # Print optimizer state sharding to verify if it is sharded
+        if jax.process_index() == 0:
+            try:
+                actor_trainer = rl_cluster.actor_trainer
+                opt_state = nnx.state(actor_trainer.optimizer, nnx.optimizer.OptState)
+                flat_opt_state, _ = jax.tree_util.tree_flatten(opt_state)
+                print("lkolluru Optimizer State Leaves count:", len(flat_opt_state), flush=True)
+                for i, leaf in enumerate(flat_opt_state[:5]):  # print first few leaves
+                     print(f"lkolluru OptState Leaf {i} shape {leaf.shape}: sharding:", getattr(leaf, "sharding", None), flush=True)
+            except Exception as e:
+                print(f"lkolluru Failed to print optimizer state: {e}", flush=True)
+            
+            try:
+                device = jax.local_devices()[0]
+                mem_stats = device.memory_stats()
+                in_use_gb = mem_stats['bytes_in_use'] / (1024**3)
+                peak_gb = mem_stats['peak_bytes_in_use'] / (1024**3)
+                limit_gb = mem_stats['bytes_limit'] / (1024**3)
+                print(f"lkolluru TPU 0 Memory Stats: In Use: {in_use_gb:.2f} GB, Peak: {peak_gb:.2f} GB, Limit: {limit_gb:.2f} GB", flush=True)
+            except Exception as e:
+                print(f"lkolluru Failed to print TPU memory stats: {e}", flush=True)
     
     grpo_trainer = GRPOLearner(
         rl_cluster=rl_cluster,
@@ -1153,10 +1263,10 @@ def main(_):
         print(f"Explicit XML Reward Mean: {np.mean(x_arr):.4f}, Format: {np.mean(f_arr):.4f}", flush=True)
 
         log_metrics = {
-            "rewards/math_reward_fn": (float(np.mean(m_arr)), None),
-            "rewards/xml_reward_fn": (float(np.mean(x_arr)), None),
-            "rewards/format_reward_fn": (float(np.mean(f_arr)), None),
-            "rewards/sum": (float(np.mean(total_arr)), None),
+            "rewards/math_reward_fn": (float(np.mean(m_arr)), np.mean),
+            "rewards/xml_reward_fn": (float(np.mean(x_arr)), np.mean),
+            "rewards/format_reward_fn": (float(np.mean(f_arr)), np.mean),
+            "rewards/sum": (float(np.mean(total_arr)), np.mean),
         }
 
         if hasattr(grpo_trainer.reward_manager, "metrics"):
@@ -1171,9 +1281,15 @@ def main(_):
     
     #evaluate_model(rl_cluster, test_ds, cluster_config.rollout_config)
     grpo_trainer.train(train_ds, test_ds)
+    
+    # Re-initialize an active wandb run context for evaluation since grpo_trainer.train()
+    # automatically calls wandb.finish() when closing the cluster.
+    # wandb.init()
     evaluate_model(rl_cluster, test_ds, cluster_config.rollout_config)
-    wandb.finish()
+   
 
 if __name__ == "__main__":
     pathwaysutils.initialize()
     app.run(main)
+    if wandb.run is not None:
+        wandb.finish()
