@@ -10,7 +10,7 @@ import signal
 import threading
 import time
 from collections.abc import Sequence
-from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union
+from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union, TYPE_CHECKING
 
 import jax
 import numpy as np
@@ -51,6 +51,7 @@ from axlearn.common.monitoring.device_monitor import DeviceMonitor
 from axlearn.common.optimizer_base import NestedOptParam, OptParam
 from axlearn.common.param_init import DefaultInitializer
 from axlearn.common.snapshot import Snapshotter
+
 from axlearn.common.state_builder import Builder as TrainerStateBuilder
 from axlearn.common.summary_writer import BaseWriter, SummaryWriter
 from axlearn.common.update_transformation import ForwardOutputs  # pytype: disable=pyi-error
@@ -72,17 +73,26 @@ from axlearn.common.utils import (
 )
 
 
-def _sync_restore_class_vars(
+def _sync_restore_class_vars( # pylint: disable=too-many-locals
     jax_device_state: dict, python_vars: dict, immutable_data: dict
 ) -> Any:
     """Initializes SpmdTrainer, restores its state, and runs it."""
-    import copy
+    import copy # pylint: disable=import-outside-toplevel
     trainer = SpmdTrainer.__new__(SpmdTrainer)
-    prng_key = jax_device_state["_trainer_state"].prng_key
+
+    # Restore everything first.
     for state_dict in (jax_device_state, python_vars, immutable_data):
         for k, v in state_dict.items():
             setattr(trainer, k, v)
-            
+
+    # Now load from snapshot.
+    snapshot_mgr = python_vars["snapshot_mgr"]
+    restored_trainer_state = snapshot_mgr.load_pytree()
+    trainer._trainer_state = restored_trainer_state
+    trainer.snapshot_mgr = snapshot_mgr
+
+    prng_key = restored_trainer_state.prng_key # Use the restored prng_key.
+
     trainer._is_restored = True
 
     if hasattr(trainer, "_children"):
@@ -92,7 +102,7 @@ def _sync_restore_class_vars(
             trainer._children["checkpointer"]._within_context = False
             trainer._children["checkpointer"]._gc_thread = None
             trainer._children["checkpointer"]._gc_stopping = None
-            
+
     trainer._watchdog_thread = None
     trainer._watchdog_stopping = None
     trainer._device_monitor = None
@@ -100,6 +110,7 @@ def _sync_restore_class_vars(
     trainer.__post_init__()
 
     return trainer.run(prng_key)
+
 
 def _sync_store_class_vars(obj: Any) -> None:
     """Stores instance variables of an object."""
@@ -127,6 +138,14 @@ def _sync_store_class_vars(obj: Any) -> None:
     #print(jax_device_state)
     print(python_vars)
     print(immutable_data)
+    snapshot_mgr=python_vars["snapshot_mgr"]
+    print(immutable_data["_step"])
+    print(jax_device_state["_trainer_state"])
+    snapshot_mgr.save_pytree(step=immutable_data["_step"],state=jax_device_state["_trainer_state"])
+    snapshot_mgr.join()
+    python_vars["snapshot_mgr"] = snapshot_mgr
+
+
     _sync_restore_class_vars(jax_device_state, python_vars, immutable_data)
     
 
@@ -420,8 +439,10 @@ class SpmdTrainer(Module):
                 model=self._model_param_specs,
                 learner=self._learner_state_partition_specs,
             )
-            self._trainer_state_partition_specs: TrainerState = jax.tree.map(
-                lambda spec: spec.sharding, self._trainer_state_specs
+            self._trainer_state_partition_specs: TrainerState = (
+                jax.tree.map(
+                    lambda spec: spec.sharding, self._trainer_state_specs
+                )
             )
             # Create evalers, which depend on model_param_partition_specs.
             self._evalers = {}
@@ -679,7 +700,7 @@ class SpmdTrainer(Module):
             self._is_initialized = True
             #### Stores the initial state of all variables ####
             replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
-            snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx)
+            snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx, trainer_state_specs=self.trainer_state_specs)
             self.snapshot_mgr = snapshot_cfg.instantiate()
             
 
@@ -721,8 +742,8 @@ class SpmdTrainer(Module):
                         if self.step==3:
                             _sync_store_class_vars(self)
 
-                        #restore_class_vars(self, self._class_vars)
-                        
+                        # restore_class_vars(self, self._class_vars)
+
                         num_steps += 1
                         if num_steps % 100 == 0:
                             now = time.perf_counter()
