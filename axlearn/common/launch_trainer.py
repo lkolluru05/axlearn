@@ -4,6 +4,8 @@
 
 import json
 import os
+import time
+import gc
 from typing import Any, Optional
 
 import jax
@@ -12,8 +14,11 @@ from absl import flags, logging
 from axlearn.common import file_system as fs
 from axlearn.common import measurement
 from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
-from axlearn.common.trainer import SpmdTrainer, select_mesh_config
-from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
+from axlearn.common.trainer import SpmdTrainer, select_mesh_config, sync_restore_class_vars, sync_store_class_vars
+from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape, live_devices, set_elastic_manager
+from pathwaysutils.elastic import manager, elastic
+from pathwaysutils.debug import watchdog
+
 
 # Trainer-specific flags.
 flags.DEFINE_string(
@@ -116,6 +121,8 @@ flags.DEFINE_string(
 
 FLAGS = flags.FLAGS
 
+elastic_snapshotting_enabled = True
+
 
 def get_trainer_config(
     trainer_config_fn: Optional[TrainerConfigFn] = None,
@@ -148,7 +155,8 @@ def get_trainer_config(
     if flag_values.mesh_selector is not None:
         select_mesh_config(trainer_config, mesh_selector=flag_values.mesh_selector)
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
-    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
+    #trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
+    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(live_devices()), 1)
     if isinstance(trainer_config.mesh_shape, MeshShape):
         trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
@@ -189,6 +197,16 @@ def get_trainer_config(
     return trainer_config
 
 
+def is_retryable_error(e: Exception) -> bool:
+    if isinstance(e, jax.errors.JaxRuntimeError):
+        err_str = str(e)
+        if elastic.is_error_due_to_slice_down(e):
+            return True
+        if "UNAVAILABLE" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            return True
+    return False
+
+
 def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     measurement.record_event(measurement.Event.START_JOB)
     trainer_config_debug_string = trainer_config.debug_string()
@@ -207,9 +225,74 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 },
                 f,
             )
+    
+    elastic_manager = None
+    elastic_manager_initialized = False
 
-    trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
-    prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
-    output = trainer.run(prng_key)
-    measurement.record_event(measurement.Event.END_JOB)
+    output = None
+    jax_device_state = {}
+    python_vars = {}
+    immutable_data = {}
+    trainer = None
+    logging.info("[ELASTIC] Starting elastic training loop cycle.")
+    while True:
+        try:
+            if not elastic_manager_initialized:
+                if elastic_snapshotting_enabled:
+                    logging.info("[ELASTIC] Initializing elastic manager...")
+                    elastic_manager = manager.Manager()
+                    set_elastic_manager(elastic_manager)
+                    logging.info("[ELASTIC] Elastic manager initialized.")
+                else:
+                    logging.info("[ELASTIC] Elastic snapshotting disabled or not supported (no slice_index).")
+                elastic_manager_initialized = True
+
+            clean_trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
+            logging.info("[ELASTIC] Instantiated clean trainer.")
+
+            if elastic_manager and elastic_manager.new_slice_event.is_set():
+                logging.info("[ELASTIC] New slice event is set. Restoring from snapshot...")
+                elastic_manager.new_slice_event.clear()
+                trainer, prng_key = sync_restore_class_vars(clean_trainer, jax_device_state, python_vars, immutable_data)
+                logging.info("[ELASTIC] Restored trainer state from class vars.")
+            else:
+                logging.info("[ELASTIC] Starting fresh trainer (no elastic recovery triggered).")
+                trainer = clean_trainer
+                prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+
+            logging.info("[ELASTIC] Starting trainer.run().")
+            output = trainer.run(prng_key)
+            logging.info("[ELASTIC] trainer.run() completed.")
+            measurement.record_event(measurement.Event.END_JOB)
+            break
+            
+        except jax.errors.JaxRuntimeError as e:
+            if is_retryable_error(e):
+                logging.warning("[ELASTIC] Caught retryable error: %s. Retrying...", e)
+                if trainer is not None:
+                    jax_device_state = getattr(trainer, "_jax_device_state", {})
+                    python_vars = getattr(trainer, "_python_vars", {})
+                    immutable_data = getattr(trainer, "_immutable_data", {})
+
+                #     jax_device_state.pop("_mesh", None)
+                #     # Free massive XLA executables and module caches from device memory
+                #     jax_device_state.pop("_compiled_train_step", None)
+                #     jax_device_state.pop("_jit_train_step", None)
+                #     jax_device_state.pop("model", None)
+                #     jax_device_state.pop("learner", None)
+                
+                # # Clear old trainer objects and JAX caches to release TPU memory.
+                # # We keep the extracted state dicts above to restore onto the new mesh.
+                # del trainer
+                # del clean_trainer
+                # jax.clear_caches()
+                # gc.collect()
+                
+                if elastic_manager:
+                    elastic_manager.new_slice_event.set()
+                time.sleep(10)
+                continue
+            else:
+                logging.error("[ELASTIC] Caught non-retryable error: %s", e)
+                raise e
     return output
