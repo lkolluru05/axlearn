@@ -266,27 +266,30 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             measurement.record_event(measurement.Event.END_JOB)
             break
             
-        except jax.errors.JaxRuntimeError as e:
+        except Exception as e:
+            logging.exception("[ELASTIC] [EXC_DUMP] Intercepted exception in run_trainer loop: %s (%s)", e, type(e))
             if is_retryable_error(e):
                 logging.warning("[ELASTIC] Caught retryable error: %s. Retrying...", e)
                 if trainer is not None:
                     jax_device_state = getattr(trainer, "_jax_device_state", {})
                     python_vars = getattr(trainer, "_python_vars", {})
+                    if hasattr(trainer, "snapshot_mgr"):
+                        python_vars["snapshot_mgr"] = trainer.snapshot_mgr
                     immutable_data = getattr(trainer, "_immutable_data", {})
 
-                #     jax_device_state.pop("_mesh", None)
-                #     # Free massive XLA executables and module caches from device memory
-                #     jax_device_state.pop("_compiled_train_step", None)
-                #     jax_device_state.pop("_jit_train_step", None)
-                #     jax_device_state.pop("model", None)
-                #     jax_device_state.pop("learner", None)
+                    jax_device_state.pop("_mesh", None)
+                    # Free massive XLA executables and module caches from device memory
+                    jax_device_state.pop("_compiled_train_step", None)
+                    jax_device_state.pop("_jit_train_step", None)
+                    jax_device_state.pop("model", None)
+                    jax_device_state.pop("learner", None)
                 
-                # # Clear old trainer objects and JAX caches to release TPU memory.
-                # # We keep the extracted state dicts above to restore onto the new mesh.
-                # del trainer
-                # del clean_trainer
-                # jax.clear_caches()
-                # gc.collect()
+                # Clear old trainer objects and JAX caches to release TPU memory.
+                # We keep the extracted state dicts above to restore onto the new mesh.
+                trainer = None
+                clean_trainer = None
+                jax.clear_caches()
+                gc.collect()
                 
                 if elastic_manager:
                     elastic_manager.new_slice_event.set()

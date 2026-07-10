@@ -2187,20 +2187,40 @@ from pathwaysutils.elastic import manager
 
 def live_devices():
     device_list = jax.devices()
-    elastic_manager = manager.Manager()
     logging.info("[ELASTIC] pathwaysutils.is_pathways_backend_used(): %s", pathwaysutils.is_pathways_backend_used())
-    logging.info("[ELASTIC] elastic_manager: %s", elastic_manager)
-    if pathwaysutils.is_pathways_backend_used() and elastic_manager is not None:
+    if pathwaysutils.is_pathways_backend_used():
+        elastic_manager = manager.Manager()
+        logging.info("[ELASTIC] elastic_manager: %s", elastic_manager)
         import time
-        time.sleep(5)
-        active_devices = [
-                d for d in jax.devices() if d is not None and getattr(d, "slice_index", 0) in elastic_manager.active_slice_indices
+        timeout_seconds = 300
+        poll_interval = 5
+        start_time = time.time()
+
+        while time.time() - start_time < timeout_seconds:
+            # Attempt to fetch fresh indices rather than relying on cached properties
+            try:
+                from pathwaysutils.elastic import elastic
+                active_slice_indices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
+                elastic_manager.active_slice_indices = active_slice_indices
+            except Exception:
+                active_slice_indices = elastic_manager.active_slice_indices
+                
+            active_devices = [
+                d for d in device_list if d is not None and getattr(d, "slice_index", 0) in active_slice_indices
             ]
-        logging.info("[ELASTIC] active_devices count: %d", len(active_devices))
-        if active_devices:
-            return sorted(active_devices, key=lambda d: (getattr(d, "slice_index", 0), getattr(d, "coords", ())))
-        logging.info("[ELASTIC] Waiting for active_slice_indices to be populated...")
-            
+            if active_devices:
+                logging.info("[ELASTIC] Found %d active devices across slices: %s", len(active_devices), active_slice_indices)
+                return sorted(active_devices, key=lambda d: (getattr(d, "slice_index", 0), getattr(d, "coords", ())))
+
+            logging.info("[ELASTIC] Waiting for active_slice_indices to be populated (elapsed: %.1fs)...", time.time() - start_time)
+            time.sleep(poll_interval)
+
+        # Do NOT return device_list when on Pathways if active_devices is empty after timeout!
+        raise RuntimeError(
+            f"[ELASTIC] Timed out after {timeout_seconds}s waiting for active devices from Pathways elastic manager. "
+            f"Active slice indices remained empty: {elastic_manager.active_slice_indices}"
+        )
+
     return device_list
 
 

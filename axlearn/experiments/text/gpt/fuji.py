@@ -442,17 +442,18 @@ def get_trainer_kwargs(
                         config_modifiers=[
                             # REPLACE the MeshShapeModifier with this:
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(fsdp=32, model=1, data=1)
+                                mesh_shape=mesh_shape_from_axes(fsdp=32, model=1, data=-1)
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
-                                        prevent_cse=False,
-                                        policy=offload_dots_saveable_policy,
+                                        # Force the compiler to respect our remat boundaries
+                                        prevent_cse=True,
+                                        # Maximum memory savings: recompute everything
+                                        policy=jax_remat_policies.nothing_saveable,
                                     ),
                                 }
                             ),
-                            # ADD this new modifier:
                             FlashBlockSizeModifier.default_config().set(tpu_block_size=256),
                         ],
                     ),

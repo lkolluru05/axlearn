@@ -113,7 +113,7 @@ def sync_restore_class_vars(
                 logging.info("[ELASTIC] Successfully restored state from snapshot onto the new mesh.")
                 state_restored = True
             except Exception as e:
-                logging.warning("[ELASTIC] Failed to load from snapshot: %s.", e)
+                logging.exception("[ELASTIC] Failed to load from snapshot:")
 
     use_jax_state = jax_device_state_arg
     if not state_restored and use_jax_state and "_trainer_state" in use_jax_state:
@@ -141,7 +141,7 @@ def sync_restore_class_vars(
     if "_input_iter" in use_python_vars:
         fresh_trainer._input_iter = use_python_vars["_input_iter"]
     fresh_trainer.snapshot_mgr = snapshot_mgr
-    fresh_trainer._is_restored = True
+    fresh_trainer._is_restored = state_restored
     fresh_trainer._compiled_train_step = None
 
     fresh_trainer._watchdog_thread = None
@@ -848,10 +848,13 @@ class SpmdTrainer(Module):
 
             self._is_initialized = True
             #### Stores the initial state of all variables ####
-            replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
-            snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx, trainer_state_specs=self.trainer_state_specs)
-            self.snapshot_mgr = snapshot_cfg.instantiate()
-            logging.info("[ELASTIC] Snapshot manager instantiated.")
+            if not hasattr(self, "snapshot_mgr") or self.snapshot_mgr is None:
+                replica_axis_idx = cfg.mesh_axis_names.index("data") if "data" in cfg.mesh_axis_names else 0
+                snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx, trainer_state_specs=self.trainer_state_specs)
+                self.snapshot_mgr = snapshot_cfg.instantiate()
+                logging.info("[ELASTIC] Snapshot manager instantiated.")
+            else:
+                logging.info("[ELASTIC] Snapshot manager carried over from previous run.")
             
 
             with self.checkpointer:
@@ -993,7 +996,7 @@ class SpmdTrainer(Module):
                 trainer_state=self.trainer_state_specs,
                 built_keys=set(),
             )
-            self._step = int(prebuilt_state.step) if prebuilt_state.step is not None else None
+        self._step = int(prebuilt_state.step) if prebuilt_state.step is not None else None
         all_trainer_state_keys = {key for key, _ in utils.flatten_items(self.trainer_state_specs)}
         if prebuilt_state.built_keys == all_trainer_state_keys:
             logging.info(
