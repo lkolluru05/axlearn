@@ -447,20 +447,8 @@ def get_trainer_kwargs(
                             RematSpecModifier.default_config().set(
                                 remat_policies={
                                     "model.decoder.transformer.layer": RematSpec(
-                                        # CHANGE this from False to True:
-                                        prevent_cse=True,
-                                        policy=config_for_function(
-                                            save_and_offload_only_these_names_regex
-                                        ).set(
-                                            names_which_can_be_saved=(
-                                                RematRegexSavePatterns.QKV_PROJ.value
-                                            ),
-                                            names_which_can_be_offloaded=(
-                                                RematRegexSavePatterns.INPUT.value
-                                            ),
-                                            offload_src="device",
-                                            offload_dst="pinned_host",
-                                        ),
+                                        prevent_cse=False,
+                                        policy=offload_dots_saveable_policy,
                                     ),
                                 }
                             ),
