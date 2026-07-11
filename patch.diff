@@ -1,0 +1,112 @@
+diff --git a/axlearn/cloud/gcp/pathways_utils.py b/axlearn/cloud/gcp/pathways_utils.py
+index 3dec75aa..ef667624 100644
+--- a/axlearn/cloud/gcp/pathways_utils.py
++++ b/axlearn/cloud/gcp/pathways_utils.py
+@@ -444,6 +444,12 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
+             **common_kwargs,
+         )
+ 
++    @classmethod
++    def from_flags(cls, fv: flags.FlagValues, **kwargs):
++        cfg = super().from_flags(fv, **kwargs)
++        cfg.inner.accelerator.num_replicas = fv.num_replicas
++        return cfg
++
+     @classmethod
+     def set_defaults(cls, fv):
+         super().set_defaults(fv)
+diff --git a/axlearn/common/trainer.py b/axlearn/common/trainer.py
+index 840ccf92..03a5a75f 100644
+--- a/axlearn/common/trainer.py
++++ b/axlearn/common/trainer.py
+@@ -1605,38 +1605,40 @@ def aot_model_analysis(compiled: jax.stages.Compiled) -> str:
+ 
+ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Any) -> Any:
+     """An elastic training loop that runs SpmdTrainer and recovers from preemptions natively."""
+-    import time
+     import jax
+     import logging
+-    from pathwaysutils.elastic.elastic import wait_for_slices
++    from pathwaysutils.elastic.manager import Manager
+ 
++    manager = Manager()
+     host_memory_snapshot = None
+     
+-    def _run_training(snapshot):
++    @manager.elastic_retry()
++    def _run_training():
++        nonlocal host_memory_snapshot
+         logging.info("JAX collective is ready. Instantiating trainer.")
+         trainer = None
+         try:
+             trainer: SpmdTrainer = cfg.instantiate(parent=None)
+             
+-            if snapshot is not None:
++            if host_memory_snapshot is not None:
+                 logging.warning(
+                     "[RECOVERY_PHASE] >>> INJECTING RECOVERED SNAPSHOT MANAGER INTO TRAINER INSTANCE <<<"
+                 )
+-                trainer.snapshot_mgr = snapshot
++                trainer.snapshot_mgr = host_memory_snapshot
+                 if hasattr(trainer, "trainer_state_specs"):
+                     trainer.snapshot_mgr.trainer_state_specs = trainer.trainer_state_specs
+ 
+             logging.info("Starting trainer run...")
+             actual_prng_key = prng_key() if callable(prng_key) else prng_key
+             _ = trainer.run(actual_prng_key)
+-            return True, None
++            logging.info("Trainer run completed successfully.")
++            return
+         except Exception as e:
+             if isinstance(e, RuntimeError) and not isinstance(e, jax.errors.JaxRuntimeError):
+                 error_msg = str(e).lower()
+                 if "ifrt" not in error_msg and "shutdown" not in error_msg:
+                     raise  # Re-raise if it's an unrelated RuntimeError
+             logging.warning("[RECOVERY_PHASE] >>> Caught Error: %s <<<", e)
+-            new_snapshot = None
+             if hasattr(trainer, "snapshot_mgr"):
+                 try:
+                     trainer.snapshot_mgr.join()
+@@ -1644,33 +1646,24 @@ def elastic_training_loop(cfg: SpmdTrainer.Config, prng_key: Any) -> Any:
+                     logging.warning("[RECOVERY_PHASE] >>> Snapshotter join failed: %s <<<", cancel_err)
+                 
+                 if trainer.snapshot_mgr.latest is not None:
+-                    new_snapshot = trainer.snapshot_mgr
++                    host_memory_snapshot = trainer.snapshot_mgr
+                     logging.warning(
+                         "[RECOVERY_PHASE] >>> Saved snapshot_mgr with latest step %d for next iteration <<<",
+                         trainer.snapshot_mgr.latest.step
+                     )
+                 else:
++                    host_memory_snapshot = None
+                     logging.warning("[RECOVERY_PHASE] >>> Snapshot manager has no ready snapshots. <<<")
++            else:
++                host_memory_snapshot = None
+             
+             # Explicitly delete the trainer reference
+             del trainer
+-            return False, new_snapshot
+-            
+-    while True:
+-        logging.info("Waiting for JAX collective to be ready...")
+-        wait_for_slices(slice_count=max(1, len(set(d.slice_index for d in jax.devices()))))
+-                
+-        success, extracted_snapshot = _run_training(host_memory_snapshot)
+-        
+-        if success:
+-            logging.info("Trainer run completed successfully.")
+-            break
+-            
+-        host_memory_snapshot = extracted_snapshot
+-        if host_memory_snapshot is None:
+-            logging.warning("[RECOVERY_PHASE] >>> No host memory snapshot available for recovery. Retrying startup from scratch... <<<")
++            raise
+             
+-        logging.warning("[RECOVERY_PHASE] >>> Sleeping 30 seconds before retrying... <<<")
+-        time.sleep(30)
++    try:
++        _run_training()
++    except Exception:
++        pass
+             
+     return host_memory_snapshot

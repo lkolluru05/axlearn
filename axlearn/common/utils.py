@@ -2172,21 +2172,28 @@ def get_tpu_dot_precision(dtype) -> jax.lax.Precision:
     raise ValueError(f"Unsupported dtype {dtype}")
 
 
-import pathwaysutils
-from pathwaysutils.elastic import manager as pathways_manager
+try:
+    import pathwaysutils
+    from pathwaysutils.elastic import manager as pathways_manager
+    from pathwaysutils.elastic import manager
+except (ImportError, ModuleNotFoundError):
+    pathwaysutils = None
+    pathways_manager = None
+    manager = None
 
-elastic_manager: Optional[pathways_manager.Manager] = None
+elastic_manager: Optional[Any] = None
 
 
-def set_elastic_manager(manager: Any):
+def set_elastic_manager(manager_inst: Any):
     """Sets the global elastic manager."""
     global elastic_manager
-    elastic_manager = manager
+    elastic_manager = manager_inst
 
-from pathwaysutils.elastic import manager
 
 def live_devices():
     device_list = jax.devices()
+    if pathwaysutils is None or not hasattr(pathwaysutils, "is_pathways_backend_used") or not pathwaysutils.is_pathways_backend_used():
+        return device_list
     logging.info("[ELASTIC] pathwaysutils.is_pathways_backend_used(): %s", pathwaysutils.is_pathways_backend_used())
     if pathwaysutils.is_pathways_backend_used():
         elastic_manager = manager.Manager()

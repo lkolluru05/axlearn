@@ -124,6 +124,12 @@ FLAGS = flags.FLAGS
 elastic_snapshotting_enabled = True
 
 
+def is_pathways_proxy() -> bool:
+    """Returns True if 'proxy' is in JAX_PLATFORMS environment variable."""
+    platforms = [p.strip().lower() for p in os.getenv("JAX_PLATFORMS", "").split(",") if p.strip()]
+    return "proxy" in platforms
+
+
 def get_trainer_config(
     trainer_config_fn: Optional[TrainerConfigFn] = None,
     *,
@@ -155,10 +161,11 @@ def get_trainer_config(
     if flag_values.mesh_selector is not None:
         select_mesh_config(trainer_config, mesh_selector=flag_values.mesh_selector)
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
-    #trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
-    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(live_devices()), 1)
-    if isinstance(trainer_config.mesh_shape, MeshShape):
-        trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
+    if not is_pathways_proxy():
+        #trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
+        trainer_config.mesh_shape = trainer_config.mesh_shape or (len(live_devices()), 1)
+        if isinstance(trainer_config.mesh_shape, MeshShape):
+            trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
     if flag_values["n_steps_for_each_trace"].present:
         trainer_config.n_steps_for_each_trace = int(flag_values.n_steps_for_each_trace)
@@ -250,15 +257,36 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             clean_trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
             logging.info("[ELASTIC] Instantiated clean trainer.")
 
-            if elastic_manager and elastic_manager.new_slice_event.is_set():
-                logging.info("[ELASTIC] New slice event is set. Restoring from snapshot...")
-                elastic_manager.new_slice_event.clear()
+            # Check whether recovery should be triggered.
+            # When an in-memory retryable preemption exception occurs (e.g. in single-controller JAX where
+            # external controller events like `new_slice_event` might not be set), `python_vars["snapshot_mgr"]`
+            # or `immutable_data` / `jax_device_state` are preserved across the loop iterations (`lines 280-285`).
+            # Therefore, we MUST check `python_vars.get("snapshot_mgr") is not None or immutable_data or jax_device_state`
+            # alongside `new_slice_event.is_set()`. Even if `new_slice_event.is_set()` is `False`, preserving any
+            # snapshot manager or state triggers Phase 1 / Phase 2 recovery via `sync_restore_class_vars()`.
+            if (elastic_manager and elastic_manager.new_slice_event.is_set()) or python_vars.get("snapshot_mgr") is not None or immutable_data or jax_device_state:
+                logging.info(
+                    "[ELASTIC] [RECOVERY PHASE 1] Preserved state or new_slice_event detected after preemption/rescaling. "
+                    "Initiating class variable and snapshot restoration onto clean trainer..."
+                )
+                if elastic_manager and elastic_manager.new_slice_event.is_set():
+                    logging.info("[ELASTIC] Clearing new_slice_event flag before initiating recovery.")
+                    elastic_manager.new_slice_event.clear()
                 trainer, prng_key = sync_restore_class_vars(clean_trainer, jax_device_state, python_vars, immutable_data)
-                logging.info("[ELASTIC] Restored trainer state from class vars.")
+                logging.info("[ELASTIC] [RECOVERY PHASE 1 COMPLETE] Successfully restored trainer state from class variables.")
             else:
-                logging.info("[ELASTIC] Starting fresh trainer (no elastic recovery triggered).")
+                logging.info("[ELASTIC] Starting fresh trainer initialization (no elastic recovery triggered).")
                 trainer = clean_trainer
                 prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
+
+            if isinstance(jax_device_state, dict):
+                jax_device_state.clear()
+            try:
+                del jax_device_state, immutable_data, clean_trainer
+            except NameError:
+                pass
+            jax.clear_caches()
+            gc.collect()
 
             logging.info("[ELASTIC] Starting trainer.run().")
             output = trainer.run(prng_key)
@@ -268,28 +296,47 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             
         except Exception as e:
             logging.exception("[ELASTIC] [EXC_DUMP] Intercepted exception in run_trainer loop: %s (%s)", e, type(e))
+            if "jax_device_state" not in locals():
+                jax_device_state = {}
+            if "immutable_data" not in locals():
+                immutable_data = {}
+            if "python_vars" not in locals():
+                python_vars = {}
             if is_retryable_error(e):
-                logging.warning("[ELASTIC] Caught retryable error: %s. Retrying...", e)
+                logging.warning(
+                    "[ELASTIC] Caught retryable error: %s. Initiating in-memory state preservation and TPU cleanup...", e
+                )
                 if trainer is not None:
                     jax_device_state = getattr(trainer, "_jax_device_state", {})
                     python_vars = getattr(trainer, "_python_vars", {})
                     if hasattr(trainer, "snapshot_mgr"):
+                        # Preserve the Snapshotter instance in python_vars so its host-pinned memory
+                        # (_latest_snapshot) and queue survive across the mesh re-initialization.
                         python_vars["snapshot_mgr"] = trainer.snapshot_mgr
+                        logging.info("[ELASTIC] Preserving Snapshotter instance in python_vars for subsequent recovery.")
                     immutable_data = getattr(trainer, "_immutable_data", {})
 
+                    logging.info("[ELASTIC] Stripping physical mesh and compiled XLA executables from state to release HBM.")
                     jax_device_state.pop("_mesh", None)
-                    # Free massive XLA executables and module caches from device memory
+                    # Free massive XLA executables and module caches from device memory before mesh re-creation
                     jax_device_state.pop("_compiled_train_step", None)
                     jax_device_state.pop("_jit_train_step", None)
                     jax_device_state.pop("model", None)
                     jax_device_state.pop("learner", None)
+                    # MaxText pattern: Physical device HBM arrays (_trainer_state) are invalidated across preemption and mesh re-creation.
+                    # Pop _trainer_state from _jax_device_state so recovery relies solely on host-pinned snapshot_mgr memory.
+                    old_state = jax_device_state.pop("_trainer_state", None)
+                    if old_state is not None:
+                        jax.tree.map(lambda x: x.delete() if isinstance(x, jax.Array) and hasattr(x, "delete") else None, old_state)
                 
-                # Clear old trainer objects and JAX caches to release TPU memory.
-                # We keep the extracted state dicts above to restore onto the new mesh.
+                # Clear old trainer objects and JAX caches to release TPU HBM and device handles.
+                # We keep the extracted state dictionaries above to restore onto the new mesh.
+                logging.info("[ELASTIC] Clearing old trainer references, JAX compilation caches, and running garbage collection...")
                 trainer = None
                 clean_trainer = None
                 jax.clear_caches()
                 gc.collect()
+                logging.info("[ELASTIC] Memory cleanup complete. Setting new_slice_event and waiting 10s before retry loop.")
                 
                 if elastic_manager:
                     elastic_manager.new_slice_event.set()
