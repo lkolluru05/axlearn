@@ -49,6 +49,7 @@ from axlearn.common.trainer_config_modifier import (
     RematSpecModifier,
 )
 from axlearn.common.utils import (
+    HybridMeshShape,
     combine_remat_policies,
     extended_checkpoint_policies,
     live_devices,
@@ -442,7 +443,10 @@ def get_trainer_kwargs(
                         config_modifiers=[
                             # REPLACE the MeshShapeModifier with this:
                             MeshShapeModifier.default_config().set(
-                                mesh_shape=mesh_shape_from_axes(fsdp=32, model=1, data=-1)
+                                mesh_shape=HybridMeshShape(
+                                    ici_mesh_shape=mesh_shape_from_axes(fsdp=32),
+                                    dcn_mesh_shape=mesh_shape_from_axes(data=2),
+                                )
                             ),
                             RematSpecModifier.default_config().set(
                                 remat_policies={

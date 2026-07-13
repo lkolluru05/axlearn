@@ -193,15 +193,10 @@ class Snapshotter:
     valid_replicas = []
     for idx, r in enumerate(replicas):
         try:
-            jax.tree.map(lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else None, r)
-            _logger.info("[ELASTIC] Replica %d is valid.", idx)
-            
-            device_shardings = jax.tree.map(
-                lambda x: x.sharding.with_memory_kind("device") if hasattr(x, "sharding") else None, r
-            )
-            device_r = jax.device_put(r, device_shardings)
-            jax.tree.map(lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else None, device_r)
-            valid_replicas.append(device_r)
+            # Validate host-pinned replica buffer directly
+            jax.tree.map(lambda x: jax.block_until_ready(x) if hasattr(x, "block_until_ready") else None, r)
+            _logger.info("[ELASTIC] Replica %d is valid on host.", idx)
+            valid_replicas.append(r)
         except Exception as e:
             _logger.warning("[ELASTIC] Replica %d failed validation: %s", idx, e)
             
@@ -219,10 +214,19 @@ class Snapshotter:
             valid_replicas, mesh_axis=mesh_axis
         )
         
-    _logger.info("[ELASTIC] Resharding reconstructed state to target sharding...")
-    restored_state = jax.device_put(
-        reconstructed_state, jax.tree.map(lambda x: x.sharding if hasattr(x, "sharding") else None, abstract_state)
+    # Stage 1: Reshard on host to target mesh layout (keeping memory_kind as 'pinned_host')
+    _logger.info("[ELASTIC] Stage 1: Resharding reconstructed state on host...")
+    host_target_shardings = jax.tree.map(
+        lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") and x.sharding is not None else None, abstract_state
     )
+    host_target_state = jax.device_put(reconstructed_state, host_target_shardings)
+
+    # Stage 2: Move from host back to device (TPU) memory
+    _logger.info("[ELASTIC] Stage 2: Moving state to TPU device memory...")
+    device_target_shardings = jax.tree.map(
+        lambda x: x.sharding.with_memory_kind("device") if hasattr(x, "sharding") and x.sharding is not None else None, abstract_state
+    )
+    restored_state = jax.device_put(host_target_state, device_target_shardings)
     jax.block_until_ready(restored_state)
     
     if reset_snapshot_state:
@@ -233,7 +237,7 @@ class Snapshotter:
         gc.collect()
         
         host_target_shardings = jax.tree.map(
-            lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") else None, restored_state
+            lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") and x.sharding is not None else None, restored_state
         )
         host_target_state = jax.device_put(restored_state, host_target_shardings)
         with self._lock:

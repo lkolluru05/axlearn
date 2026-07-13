@@ -120,7 +120,10 @@ def sync_restore_class_vars(
     if snapshot_mgr is not None:
         with mesh:
             try:
-                restored_trainer_state = snapshot_mgr.load_pytree(abstract_state=fresh_trainer._trainer_state_specs)
+                restored_trainer_state = snapshot_mgr.load_pytree(
+                    abstract_state=fresh_trainer._trainer_state_specs,
+                    reset_snapshot_state=False
+                )
                 snapshot_mgr.trainer_state_specs = fresh_trainer._trainer_state_specs
                 fresh_trainer._trainer_state = restored_trainer_state
                 if getattr(snapshot_mgr, "latest", None) is not None:
@@ -439,7 +442,7 @@ class SpmdTrainer(Module):
         devices: Optional[np.ndarray] = None,
     ):
         super().__init__(cfg, parent=parent)
-        cfg = self.config
+        cfg = self._config
 
         if not cfg.prune_empty_state_updates:
             raise ValueError(
