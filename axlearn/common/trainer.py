@@ -103,13 +103,31 @@ def sync_restore_class_vars(
 
     mesh = fresh_trainer._mesh
 
+    use_jax_state = jax_device_state_arg
+    if use_jax_state and "_trainer_state" in use_jax_state:
+        try:
+            old_state = use_jax_state.pop("_trainer_state")
+            jax.tree_util.tree_map(
+                lambda x: x.delete() if isinstance(x, jax.Array) else None,
+                old_state
+            )
+            logging.info("[ELASTIC] Successfully deleted pre-existing physical arrays from old state.")
+        except Exception as e:
+            logging.warning("[ELASTIC] Failed to delete pre-existing physical arrays: %s", e)
+
     state_restored = False
     snapshot_mgr = use_python_vars.get("snapshot_mgr")
     if snapshot_mgr is not None:
         with mesh:
             try:
-                restored_trainer_state = snapshot_mgr.load_pytree()
+                restored_trainer_state = snapshot_mgr.load_pytree(abstract_state=fresh_trainer._trainer_state_specs)
+                snapshot_mgr.trainer_state_specs = fresh_trainer._trainer_state_specs
                 fresh_trainer._trainer_state = restored_trainer_state
+                if getattr(snapshot_mgr, "latest", None) is not None:
+                    try:
+                        fresh_trainer._step = int(snapshot_mgr.latest.step)
+                    except Exception as e:
+                        logging.warning("Failed to extract step from snapshot_mgr.latest: %s", e)
                 logging.info("[ELASTIC] Successfully restored state from snapshot onto the new mesh.")
                 state_restored = True
             except Exception as e:
@@ -132,7 +150,8 @@ def sync_restore_class_vars(
 
     if not state_restored:
         logging.info("[ELASTIC] [!] Falling back to fresh init().")
-        fresh_trainer.init(jax.random.PRNGKey(seed=42))
+        with mesh:
+            fresh_trainer.init(jax.random.PRNGKey(seed=42))
         if "_step" in use_immutable_data:
             fresh_trainer._step = int(use_immutable_data["_step"])
         elif "_step" in use_python_vars:
@@ -149,7 +168,13 @@ def sync_restore_class_vars(
     fresh_trainer._device_monitor = None
     fresh_trainer._recorder = None
 
-    fresh_prng_key = jax.random.PRNGKey(seed=int(fresh_trainer.step if fresh_trainer.step is not None else 42))
+    if isinstance(mesh, jax.sharding.Mesh):
+        fresh_prng_key = jax.device_put(
+            jax.random.PRNGKey(seed=int(fresh_trainer.step if fresh_trainer.step is not None else 42)),
+            jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        )
+    else:
+        fresh_prng_key = jax.random.PRNGKey(seed=int(fresh_trainer.step if fresh_trainer.step is not None else 42))
 
     try:
         if hasattr(fresh_trainer._trainer_state, "_replace"):
@@ -214,8 +239,14 @@ def sync_store_class_vars(obj: Any) -> tuple[dict, dict, dict]:
             if step_val is None:
                 step_val = python_vars.get("_step")
             snapshot_mgr.save_pytree(step=int(step_val) if step_val is not None else 0, state=jax_device_state["_trainer_state"])
-            snapshot_mgr.join()
+            # Snapshot joining is removed to allow asynchronous host backup.
         except Exception as e:
+            err_str = str(e).lower()
+            if isinstance(e, jax.errors.JaxRuntimeError) or any(
+                keyword in err_str for keyword in ["data_loss", "unavailable", "unplaced", "slice down", "died"]
+            ):
+                logging.error("[CRITICAL ERROR] Preemption or hardware device error detected during snapshot save/join: %s", e)
+                raise e
             logging.warning("[ELASTIC] Failed during snapshot save: %s", e)
     logging.info("[ELASTIC] Storing class variables done.")
     python_vars["snapshot_mgr"] = snapshot_mgr
@@ -463,8 +494,18 @@ class SpmdTrainer(Module):
         live_devs = utils.live_devices() if devices is None else devices
         device_platform = live_devs[0].platform
         device_attr = "process_index" if device_platform != "tpu" else "slice_index"
-        num_granules = len(set(getattr(el, device_attr) for el in live_devs))
-        num_devices_per_granule = len(live_devs) // num_granules
+        num_granules = max(1, len(set(getattr(el, device_attr) for el in live_devs)))
+        num_devices_per_granule = max(1, len(live_devs) // num_granules)
+
+        # Extract original_granules from cfg.mesh_shape before it is updated.
+        if isinstance(cfg.mesh_shape, HybridMeshShape):
+            original_granules = math.prod(cfg.mesh_shape.dcn_mesh_shape)
+        elif isinstance(cfg.mesh_shape, Sequence) and not isinstance(cfg.mesh_shape, str):
+            original_granules = cfg.mesh_shape[0] if len(cfg.mesh_shape) > 0 else 1
+        else:
+            original_granules = 1
+            
+        original_granules = max(1, original_granules)
 
         if isinstance(cfg.mesh_shape, Sequence) and not isinstance(cfg.mesh_shape, str):
             original_mesh_shape = list(cfg.mesh_shape)
@@ -525,6 +566,45 @@ class SpmdTrainer(Module):
 
             cfg.mesh_shape = HybridMeshShape(ici_mesh_shape=tuple(ici_shape), dcn_mesh_shape=tuple(dcn_shape))
             logging.info("[!] Dynamically updating HybridMeshShape to %s", cfg.mesh_shape)
+
+        if num_granules < original_granules:
+            logging.info(
+                "[ELASTIC] Applying fractional scaling due to mesh degradation: %d -> %d slices.",
+                original_granules,
+                num_granules,
+            )
+            
+            # 1. Simple input batch size
+            if hasattr(cfg.input, "batch_size") and getattr(cfg.input, "batch_size", None) is not None:
+                old_bs = cfg.input.batch_size
+                scaled_bs = (old_bs * num_granules) // original_granules
+                cfg.input.batch_size = max(1, scaled_bs)
+                logging.info("[ELASTIC] Scaled simple batch_size from %s to %s", old_bs, cfg.input.batch_size)
+            
+            # 2. Production input batch size
+            if hasattr(cfg.input, "input_dispatcher") and getattr(cfg.input, "input_dispatcher", None) is not None:
+                dispatcher = cfg.input.input_dispatcher
+                if hasattr(dispatcher, "global_logical_batch_size") and getattr(dispatcher, "global_logical_batch_size", None) is not None:
+                    old_bs = dispatcher.global_logical_batch_size
+                    scaled_bs = (old_bs * num_granules) // original_granules
+                    dispatcher.global_logical_batch_size = max(1, scaled_bs)
+                    logging.info("[ELASTIC] Scaled production global_logical_batch_size from %s to %s", old_bs, dispatcher.global_logical_batch_size)
+            
+            # 3. Simple gradient accumulation
+            if hasattr(cfg.learner, "gradient_accumulation_steps") and getattr(cfg.learner, "gradient_accumulation_steps", None) is not None:
+                old_gas = cfg.learner.gradient_accumulation_steps
+                scaled_gas = (old_gas * original_granules + num_granules - 1) // num_granules
+                cfg.learner.gradient_accumulation_steps = max(1, scaled_gas)
+                logging.info("[ELASTIC] Scaled simple gradient_accumulation_steps from %s to %s", old_gas, cfg.learner.gradient_accumulation_steps)
+            
+            # 4. Production gradient accumulation
+            if hasattr(cfg.learner, "forward_fn_transformation") and getattr(cfg.learner, "forward_fn_transformation", None) is not None:
+                fft = cfg.learner.forward_fn_transformation
+                if hasattr(fft, "steps") and getattr(fft, "steps", None) is not None:
+                    old_steps = fft.steps
+                    scaled_steps = (old_steps * original_granules + num_granules - 1) // num_granules
+                    fft.steps = max(1, scaled_steps)
+                    logging.info("[ELASTIC] Scaled production forward_fn_transformation steps from %s to %s", old_steps, fft.steps)
 
         self._step_log("Mesh shape: %s", cfg.mesh_shape)
         devices = (
@@ -896,9 +976,8 @@ class SpmdTrainer(Module):
                                 )
                                 self._step_log("[ELASTIC] Done step")
                                 logging.info("[ELASTIC] Done step %s", self.step)
-                                # if self.step==3:
-                                #     _sync_store_class_vars(self)
-                                self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
+                                if self.step % 5 == 0:
+                                    self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
         
                                 num_steps += 1
                                 if num_steps % 100 == 0:
@@ -1275,9 +1354,18 @@ class SpmdTrainer(Module):
             ckpt_state = self._trainer_state._asdict()
             if cfg.save_input_iterator:
                 ckpt_state["input_iter"] = self._input_iter
-            self.checkpointer.save(
-                step=int(self.step) if self.step is not None else 0, state=ckpt_state, evaler_summaries=evaler_summaries
-            )
+            try:
+                self.checkpointer.save(
+                    step=int(self.step) if self.step is not None else 0, state=ckpt_state, evaler_summaries=evaler_summaries
+                )
+            except SystemExit as e:
+                import os
+                import logging
+                logging.info("[ELASTIC] Intercepted SystemExit during checkpointer.save: %s", e)
+                if "pre-emption" in str(e).lower() or "preemption" in str(e).lower():
+                    logging.info("[ELASTIC] Fast exiting via os._exit(0) to bypass atexit hangs.")
+                    os._exit(0)
+                raise
 
     def _restore_from_builder(self) -> Optional[TrainerStateBuilder.State]:
         """Restores trainer state by building it with init_state_builder."""
@@ -1491,7 +1579,12 @@ class SpmdTrainer(Module):
             A compiled training step, with signature matching self._pjit_train_step's return.
         """
         with self.mesh(), self._context_manager():
-            if trainer_state is None:
+            if trainer_state is not None:
+                trainer_state = jax.tree.map(
+                    lambda x: jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype, sharding=getattr(x, "sharding", None)) if hasattr(x, "shape") else x,
+                    trainer_state
+                )
+            else:
                 # Do not run init(), which requires real devices.
                 trainer_state = jax.tree.map(
                     lambda spec: jax.ShapeDtypeStruct(shape=spec.shape, dtype=spec.dtype),

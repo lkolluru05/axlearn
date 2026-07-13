@@ -14,60 +14,9 @@ from orbax.checkpoint.experimental.v1._src.tree import types as tree_types  # py
 from pathwaysutils.experimental import concatenate_by_mesh_axis  # pytype: disable=import-error
 from pathwaysutils.experimental import split_by_mesh_axis  # pytype: disable=import-error
 import jax.numpy as jnp
-from axlearn.common.utils import Nested, TensorSpec, get_current_abstract_or_physical_mesh, live_devices
+from axlearn.common.utils import Nested, TensorSpec, get_current_abstract_or_physical_mesh
 
 _logger = logging
-
-
-class HostSnapshotArray:
-  """Wraps decomposed host-pinned shards of a JAX array to prevent global invalidation."""
-  def __init__(self, shards: dict[int, tuple[tuple[slice, ...], jax.Array]], shape: tuple[int, ...], dtype: Any, sharding: jax.sharding.Sharding):
-    self.shards = shards  # dict[device_id, (shard_index, shard_host_array)]
-    self.shape = shape
-    self.dtype = dtype
-    self.sharding = sharding
-
-def _decompose_array_to_host_shards(x: Any) -> Any:
-  if not isinstance(x, jax.Array) or not hasattr(x, "addressable_shards"):
-    return x
-  
-  shards_dict = {}
-  for shard in x.addressable_shards:
-    device = shard.device
-    sharding = jax.sharding.SingleDeviceSharding(device, memory_kind="pinned_host")
-    shard_host = jax.device_put(shard.data, sharding)
-    shards_dict[device.id] = (shard.index, shard_host)
-  return HostSnapshotArray(shards_dict, x.shape, x.dtype, x.sharding)
-
-def _resolve_slice(s: slice, dim_size: int) -> slice:
-  start = s.start if s.start is not None else 0
-  stop = s.stop if s.stop is not None else dim_size
-  step = s.step if s.step is not None else 1
-  return slice(start, stop, step)
-
-def _get_intersection_and_offsets(target_slices, source_slices, target_shape, source_shape):
-  target_idx = []
-  source_idx = []
-  for i, (t_slice, s_slice) in enumerate(zip(target_slices, source_slices)):
-    resolved_t = _resolve_slice(t_slice, target_shape[i])
-    resolved_s = _resolve_slice(s_slice, source_shape[i])
-    
-    t_start = resolved_t.start
-    t_stop = resolved_t.stop
-    s_start = resolved_s.start
-    s_stop = resolved_s.stop
-    
-    start = max(t_start, s_start)
-    stop = min(t_stop, s_stop)
-    
-    if start >= stop:
-      return None
-      
-    target_idx.append(slice(start - t_start, stop - t_start))
-    source_idx.append(slice(start - s_start, stop - s_start))
-    
-  return tuple(target_idx), tuple(source_idx)
-
 
 
 class Snapshotter:
@@ -84,7 +33,11 @@ class Snapshotter:
 
   def _worker(self):
     while True:
-      pinned_state, step = self._queue.get()
+      task = self._queue.get()
+      if task is None:
+        self._queue.task_done()
+        break
+      pinned_state, step = task
       _logger.info("[ELASTIC] Snapshot worker dequeued task for step %d", step)
       try:
         _logger.info(
@@ -122,20 +75,53 @@ class Snapshotter:
       _logger.warning("[ELASTIC] Snapshotter busy. Skipping snapshot for step %d", step)
       return
 
-    _logger.info("[ELASTIC] Decomposing snapshot state to single-device host-pinned arrays for step %d...", step)
-    pinned_state = jax.tree.map(_decompose_array_to_host_shards, state)
-    _logger.info("[ELASTIC] Decomposed snapshot state secured for step %d.", step)
+    with self._lock:
+      old_snapshot = self._latest_snapshot
+      self._latest_snapshot = None
+
+    if old_snapshot is not None:
+      old_state, _ = old_snapshot
+      _logger.info("[ELASTIC] Deleting old snapshot from Host RAM before allocating new one.")
+      
+      jax.tree.map(
+          lambda x: x.delete() if hasattr(x, "delete") else None,
+          old_state
+      )
+      
+      del old_state
+      del old_snapshot
+      import gc
+      gc.collect()
+
+    _logger.info("[ELASTIC] Moving snapshot state to host-pinned memory for step %d...", step)
+    pinned_shardings = jax.tree.map(
+        lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") else None, state
+    )
+    pinned_state = jax.device_put(state, pinned_shardings)
+    _logger.info("[ELASTIC] Snapshot state secured in host-pinned memory for step %d.", step)
     self._queue.put((pinned_state, step))
 
   def cancel_pending(self):
-    """Clears any pending snapshot saves from the queue."""
-    _logger.info("[ELASTIC] Canceling any pending snapshot saves.")
+    """Clears any pending snapshot saves from the queue and resets the worker thread."""
+    _logger.info("[ELASTIC] Canceling any pending snapshot saves and resetting worker thread.")
     while not self._queue.empty():
         try:
-            self._queue.get_nowait()
+            task = self._queue.get_nowait()
+            if task is not None:
+                pinned_state, _ = task
+                jax.tree.map(
+                    lambda x: x.delete() if hasattr(x, "delete") else None,
+                    pinned_state
+                )
             self._queue.task_done()
         except queue.Empty:
             break
+            
+    self._queue.put(None)
+    self._worker_thread.join()
+    
+    self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+    self._worker_thread.start()
 
   def load_pytree(
       self,
@@ -166,13 +152,24 @@ class Snapshotter:
         abstract_state = self.trainer_state_specs
 
     def spec_to_sds(spec):
-        if hasattr(spec, "sharding"):
-            return spec
         if not hasattr(spec, "shape"):
             return spec
         mesh = get_current_abstract_or_physical_mesh()
-        # Create proper NamedSharding from TensorSpec mesh_axes
-        sharding = jax.sharding.NamedSharding(mesh, getattr(spec, "mesh_axes", None))
+        mesh_axes = getattr(spec, "mesh_axes", None)
+        if mesh_axes is None:
+            if hasattr(spec, "sharding") and hasattr(spec.sharding, "spec"):
+                mesh_axes = spec.sharding.spec
+            else:
+                mesh_axes = jax.sharding.PartitionSpec()
+        if not isinstance(mesh_axes, jax.sharding.PartitionSpec):
+            if isinstance(mesh_axes, (tuple, list)):
+                mesh_axes = jax.sharding.PartitionSpec(*mesh_axes)
+            else:
+                mesh_axes = jax.sharding.PartitionSpec()
+        if isinstance(mesh, jax.sharding.Mesh):
+            sharding = jax.sharding.NamedSharding(mesh, mesh_axes)
+        else:
+            sharding = None
         return jax.ShapeDtypeStruct(spec.shape, spec.dtype, sharding=sharding)
 
     abstract_state = jax.tree.map(spec_to_sds, abstract_state, is_leaf=lambda x: hasattr(x, "shape"))
@@ -182,118 +179,66 @@ class Snapshotter:
         raise RuntimeError("No snapshots available to restore from.")
       pinned_state, step = self._latest_snapshot
 
-    import numpy as np
-    healthy_device_ids = {d.id for d in live_devices()}
-    local_devices = jax.local_devices()
-    _logger.info("[ELASTIC] Healthy device IDs for restoration: %s", healthy_device_ids)
-
-    def extract_and_reshard(path, x, target_x, target_sharding):
-      path_str = jax.tree_util.keystr(path)
-      if not isinstance(x, HostSnapshotArray):
-        return jax.device_put(x, target_sharding) if target_sharding else x
-
-      all_devices_healthy = all(d.id in healthy_device_ids for d in x.sharding.device_set)
-
-      # Eagerly convert all JAX host-pinned shards to NumPy arrays to strip JAX annotations
-      numpy_shards = {}
-      for dev_id, (source_index, source_array) in x.shards.items():
-        if dev_id in healthy_device_ids:
-          try:
-            numpy_shards[dev_id] = (source_index, np.asarray(source_array), source_array.device)
-          except Exception as read_err:
-            _logger.warning("[ELASTIC] Failed to eager read shard on device %d for %s: %s", dev_id, path_str, read_err)
-
-      if all_devices_healthy:
+    mesh = get_current_abstract_or_physical_mesh()
+    if not isinstance(mesh, jax.sharding.Mesh):
+        raise RuntimeError(f"Expected a jax.sharding.Mesh, got {mesh}")
+    
+    mesh_axis = mesh.axis_names[self.replica_axis_index]
+    _logger.info("[ELASTIC] Splitting snapshot along mesh axis %s to find valid replicas...", mesh_axis)
+    
+    replicas = split_by_mesh_axis.split_by_mesh_axis(
+        pinned_state, mesh_axis=mesh_axis
+    )
+    
+    valid_replicas = []
+    for idx, r in enumerate(replicas):
         try:
-          _logger.info("[ELASTIC] All source devices healthy. Reconstructing global NumPy array. Path: %s", path_str)
-          global_np = np.zeros(x.shape, dtype=x.dtype)
-          for dev_id, (source_index, source_array_np, _) in numpy_shards.items():
-            global_np[source_index] = source_array_np
-          
-          if global_np.shape != target_x.shape:
-            stops = [min(s1, s2) for s1, s2 in zip(global_np.shape, target_x.shape)]
-            slices = tuple(slice(0, stop) for stop in stops)
-            sliced_x = global_np[slices]
-            pad_widths = [(0, max(0, s2 - s1)) for s1, s2 in zip(global_np.shape, target_x.shape)]
-            if any(p > 0 for _, p in pad_widths):
-              sliced_x = np.pad(sliced_x, pad_widths)
-            global_np = sliced_x
+            jax.tree.map(lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else None, r)
+            _logger.info("[ELASTIC] Replica %d is valid.", idx)
             
-          return jax.device_put(global_np, target_sharding) if target_sharding else global_np
+            device_shardings = jax.tree.map(
+                lambda x: x.sharding.with_memory_kind("device") if hasattr(x, "sharding") else None, r
+            )
+            device_r = jax.device_put(r, device_shardings)
+            jax.tree.map(lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else None, device_r)
+            valid_replicas.append(device_r)
         except Exception as e:
-          _logger.warning("[ELASTIC] NumPy-native path failed: %s. Falling back to manual extraction callback. Path: %s", e, path_str)
-
-      def recovery_callback(index):
-        resolved_target_slices = tuple(
-            _resolve_slice(s, dim_size) for s, dim_size in zip(index, target_x.shape)
+            _logger.warning("[ELASTIC] Replica %d failed validation: %s", idx, e)
+            
+    if not valid_replicas:
+        raise RuntimeError(f"No valid replicas found for snapshot at step {step}.")
+        
+    _logger.info("[ELASTIC] Found %d valid replicas.", len(valid_replicas))
+    
+    if len(valid_replicas) == 1:
+        _logger.info("[ELASTIC] Only 1 valid replica found. Skipping concatenation.")
+        reconstructed_state = valid_replicas[0]
+    else:
+        _logger.info("[ELASTIC] Concatenating valid replicas along axis %s...", mesh_axis)
+        reconstructed_state = concatenate_by_mesh_axis.concatenate_by_mesh_axis(
+            valid_replicas, mesh_axis=mesh_axis
         )
         
-        # Check if this index belongs to a local device
-        is_local = False
-        if target_sharding is not None:
-          local_target_slices_map = target_sharding.addressable_devices_indices_map(target_x.shape)
-          for d, s in local_target_slices_map.items():
-            if d in local_devices and s is not None:
-              resolved_s = tuple(_resolve_slice(sl, dim_size) for sl, dim_size in zip(s, target_x.shape))
-              if resolved_target_slices == resolved_s:
-                is_local = True
-                break
-        else:
-          is_local = True
-
-        shard_shape = tuple(s.stop - s.start for s in resolved_target_slices)
-        target_buf = np.zeros(shard_shape, dtype=x.dtype)
-        
-        if not is_local:
-          return target_buf
-
-        filled_mask = np.zeros(shard_shape, dtype=bool)
-        
-        for dev_id, (source_index, source_numpy, source_device) in numpy_shards.items():
-          if source_device not in local_devices:
-            continue
-            
-          res = _get_intersection_and_offsets(
-              resolved_target_slices, source_index, target_x.shape, x.shape
-          )
-          if res is not None:
-            target_idx, source_idx = res
-            target_buf[target_idx] = source_numpy[source_idx]
-            filled_mask[target_idx] = True
-              
-        if not np.all(filled_mask):
-          raise RuntimeError(
-              f"Not all parts of the array local to this host under the target TPU sharding "
-              f"could be recovered from local surviving shards (cross-host transfer not supported in fallback) "
-              f"for leaf: {path_str}."
-          )
-        return target_buf
-
-      return jax.make_array_from_callback(target_x.shape, target_sharding, recovery_callback)
-
-    _logger.info("[ELASTIC] Restoring and moving snapshot from pinned host to target host sharding...")
-    host_target_shardings = jax.tree.map(
-        lambda x: x.sharding if hasattr(x, "sharding") else None, abstract_state
+    _logger.info("[ELASTIC] Resharding reconstructed state to target sharding...")
+    restored_state = jax.device_put(
+        reconstructed_state, jax.tree.map(lambda x: x.sharding if hasattr(x, "sharding") else None, abstract_state)
     )
-    host_target_state = jax.tree_util.tree_map_with_path(
-        extract_and_reshard, pinned_state, abstract_state, host_target_shardings
-    )
-    restored_state = host_target_state
-    _logger.info("[ELASTIC] Snapshot successfully restored onto the target mesh.")
-
-    del pinned_state
-
+    jax.block_until_ready(restored_state)
+    
     if reset_snapshot_state:
-      _logger.info("[ELASTIC] Resetting snapshot state to restored state in host-pinned memory...")
-      with self._lock:
-        self._latest_snapshot = None
-      import gc
-      gc.collect()
-
-      decomposed_restored_state = jax.tree.map(_decompose_array_to_host_shards, restored_state)
-      with self._lock:
-        self._latest_snapshot = (decomposed_restored_state, step)
-
+        _logger.info("[ELASTIC] Resetting snapshot state to restored state in host-pinned memory...")
+        with self._lock:
+            self._latest_snapshot = None
+        import gc
+        gc.collect()
+        
+        host_target_shardings = jax.tree.map(
+            lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") else None, restored_state
+        )
+        host_target_state = jax.device_put(restored_state, host_target_shardings)
+        with self._lock:
+            self._latest_snapshot = (host_target_state, step)
+            
     return restored_state
 
   def join(self) -> None:

@@ -285,7 +285,6 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 del jax_device_state, immutable_data, clean_trainer
             except NameError:
                 pass
-            jax.clear_caches()
             gc.collect()
 
             logging.info("[ELASTIC] Starting trainer.run().")
@@ -331,10 +330,9 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 
                 # Clear old trainer objects and JAX caches to release TPU HBM and device handles.
                 # We keep the extracted state dictionaries above to restore onto the new mesh.
-                logging.info("[ELASTIC] Clearing old trainer references, JAX compilation caches, and running garbage collection...")
+                logging.info("[ELASTIC] Clearing old trainer references and running garbage collection...")
                 trainer = None
                 clean_trainer = None
-                jax.clear_caches()
                 gc.collect()
                 logging.info("[ELASTIC] Memory cleanup complete. Setting new_slice_event and waiting 10s before retry loop.")
                 
