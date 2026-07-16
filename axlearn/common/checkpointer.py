@@ -907,7 +907,7 @@ class BaseCheckpointer(Module):
         self._within_context = False
 
     def save(
-        self, *, step: int, state: NestedTensor, evaler_summaries: Optional[dict[str, Any]] = None
+        self, *, step: int, state: NestedTensor, evaler_summaries: Optional[dict[str, Any]] = None, force: bool = False
     ):
         """Saves `state` at the given `step`.
 
@@ -1106,14 +1106,14 @@ class Checkpointer(BaseCheckpointer):
         return build_step_dir(cfg.dir, step=step)
 
     def save(
-        self, *, step: int, state: NestedTensor, evaler_summaries: Optional[dict[str, Any]] = None
+        self, *, step: int, state: NestedTensor, evaler_summaries: Optional[dict[str, Any]] = None, force: bool = False
     ):
         """See `BaseCheckpointer.save` for details.
 
         In addition to behavior in `BaseCheckpointer`, saving only happens if the configured
-        checkpoint policy returns True for the given step and evaler summaries.
+        checkpoint policy returns True for the given step and evaler summaries, unless force is True.
         """
-        if not self._save_policy(step=step, evaler_summaries=(evaler_summaries or {})):
+        if not force and not self._save_policy(step=step, evaler_summaries=(evaler_summaries or {})):
             return
         if step < 0 or step >= 10**8:
             raise ValueError(f"Out-of-range: {step}")

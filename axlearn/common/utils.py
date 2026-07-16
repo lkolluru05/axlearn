@@ -2242,3 +2242,14 @@ def wait_for_all_devices(timeout_seconds: int = 300):
 
 def live_slice_indices() -> set[int]:
     return {d.slice_index for d in live_devices()}
+
+
+class ScaleUpRequest(Exception):
+    """Raised when a scale-up event is detected and training needs to be interrupted."""
+    pass
+
+
+def get_elastic_manager() -> Optional[Any]:
+    """Returns the globally registered elastic manager instance."""
+    global elastic_manager
+    return elastic_manager

@@ -2,6 +2,7 @@
 
 """Tests for elastic recovery regressions in snapshotting and trainer pipelines."""
 
+import threading
 from typing import Optional
 from unittest import mock
 import tempfile
@@ -123,6 +124,8 @@ class ElasticRecoveryRegressionTest(parameterized.TestCase):
     """Regression 4: Preserved snapshot_mgr triggers Phase 1/Phase 2 recovery."""
     mock_trainer_config = mock.MagicMock()
     mock_clean_trainer = mock.MagicMock()
+    mock_clean_trainer._immutable_data = {}
+    mock_clean_trainer._python_vars = {}
     mock_trainer_config.instantiate.return_value = mock_clean_trainer
 
     mock_snapshot_mgr = mock.MagicMock()
@@ -344,6 +347,128 @@ class ElasticRecoveryRegressionTest(parameterized.TestCase):
     self.assertEqual(trainer.config.learner.gradient_accumulation_steps, 2)
     self.assertEqual(trainer.input.config.batch_size, 32)
     self.assertEqual(trainer.learner.config.gradient_accumulation_steps, 2)
+
+  def test_scale_up_monitoring_and_recovery(self):
+    """Tests that run_trainer starts monitor thread, detects scale-up, and recovers."""
+    mock_trainer_config = mock.MagicMock()
+    mock_clean_trainer = mock.MagicMock()
+    mock_clean_trainer._immutable_data = {}
+    mock_clean_trainer._python_vars = {}
+    mock_trainer_config.instantiate.return_value = mock_clean_trainer
+    mock_trainer_config.mesh_shape = (2, 8)
+
+    mock_elastic_manager = mock.MagicMock()
+    mock_elastic_manager.all_slice_indices = {0, 1}
+    mock_elastic_manager.active_slice_indices = {1}
+    mock_elastic_manager.slice_to_devices = {0: [mock.Mock()], 1: [mock.Mock()]}
+    new_slice_event = threading.Event()
+    mock_elastic_manager.new_slice_event = new_slice_event
+
+    # Mock _monitor_new_slices to set the event after a short delay
+    def mock_monitor(stop_event, poll_interval):
+      if not stop_event.wait(0.2):
+        new_slice_event.set()
+    mock_elastic_manager._monitor_new_slices.side_effect = mock_monitor
+
+    mock_wait_for_slices = mock.MagicMock()
+    from axlearn.common.utils import ScaleUpRequest
+
+    first_run = True
+    def mock_run(key):
+      nonlocal first_run
+      if first_run:
+        first_run = False
+        # Simulate step loop checking the event
+        for _ in range(50):
+          if new_slice_event.is_set():
+            raise ScaleUpRequest("Scale-up event detected")
+          import time
+          time.sleep(0.05)
+        raise RuntimeError("Failed to detect scale-up in time")
+      return "success"
+
+    mock_clean_trainer.run.side_effect = mock_run
+
+    with mock.patch("axlearn.common.launch_trainer.FLAGS") as mock_flags, \
+         mock.patch("axlearn.common.launch_trainer.measurement"), \
+         mock.patch("axlearn.common.launch_trainer.jax.process_index", return_value=1), \
+         mock.patch("axlearn.common.launch_trainer.sync_restore_class_vars") as mock_restore, \
+         mock.patch("pathwaysutils.elastic.manager.Manager", return_value=mock_elastic_manager) as mock_manager_class, \
+         mock.patch("axlearn.common.launch_trainer.get_data_dir", return_value="/tmp"), \
+         mock.patch("axlearn.common.launch_trainer.wait_for_slices", mock_wait_for_slices), \
+         mock.patch("pathwaysutils.elastic.elastic.get_active_slice_indices", return_value={0, 1}):
+
+      mock_flags.flag_values_dict.return_value = {}
+      mock_flags.trainer_prng_seed = 1234
+      mock_restore.return_value = (mock_clean_trainer, jax.random.PRNGKey(0))
+
+      output = run_trainer(mock_trainer_config)
+
+      self.assertEqual(output, "success")
+      # Verify we waited for 2 slices (scale up target)
+      mock_wait_for_slices.assert_called_once_with(2)
+      # Verify Manager was re-instantiated on retry to update active slices
+      self.assertEqual(mock_manager_class.call_count, 2)
+      # Verify force checkpoint was saved on ScaleUpRequest
+      mock_clean_trainer.save_checkpoint.assert_called_once_with(evaler_summaries=None, force=True)
+      mock_clean_trainer.checkpointer.wait_until_finished.assert_called_once()
+      # Verify sync_restore_class_vars was NOT called (fallback to GCS)
+      mock_restore.assert_not_called()
+
+
+  def test_recovery_backoff(self):
+    """Tests that recovery loop backs off on repeated failures and resets on progress."""
+    mock_trainer_config = mock.MagicMock()
+    mock_clean_trainer = mock.MagicMock()
+    mock_trainer_config.instantiate.return_value = mock_clean_trainer
+    mock_clean_trainer._python_vars = {}
+    mock_clean_trainer._jax_device_state = {}
+    mock_clean_trainer._immutable_data = {"_step": 5}
+    mock_trainer_config.mesh_shape = (2, 8)
+
+    mock_elastic_manager = mock.MagicMock()
+    mock_elastic_manager.all_slice_indices = {0, 1}
+    mock_elastic_manager.active_slice_indices = {1}
+    mock_elastic_manager.slice_to_devices = {0: [mock.Mock()], 1: [mock.Mock()]}
+    
+    mock_wait_for_slices = mock.MagicMock()
+
+    run_count = 0
+    def mock_run(key):
+      nonlocal run_count
+      run_count += 1
+      if run_count <= 3:
+        raise RuntimeError("simulated failure")
+      return "success"
+    mock_clean_trainer.run.side_effect = mock_run
+
+    mock_restored_trainer = mock.MagicMock()
+    mock_restored_trainer.run.side_effect = mock_run
+    mock_restored_trainer._python_vars = {}
+    mock_restored_trainer._jax_device_state = {}
+    mock_restored_trainer._immutable_data = {"_step": 5}
+
+    with mock.patch("axlearn.common.launch_trainer.FLAGS") as mock_flags, \
+         mock.patch("axlearn.common.launch_trainer.measurement"), \
+         mock.patch("axlearn.common.launch_trainer.jax.process_index", return_value=1), \
+         mock.patch("axlearn.common.launch_trainer.sync_restore_class_vars") as mock_restore, \
+         mock.patch("pathwaysutils.elastic.manager.Manager", return_value=mock_elastic_manager), \
+         mock.patch("axlearn.common.launch_trainer.get_data_dir", return_value="/tmp"), \
+         mock.patch("axlearn.common.launch_trainer.wait_for_slices", mock_wait_for_slices), \
+         mock.patch("axlearn.common.launch_trainer.is_retryable_error", return_value=True), \
+         mock.patch("time.sleep") as mock_sleep:
+
+      mock_flags.flag_values_dict.return_value = {}
+      mock_flags.trainer_prng_seed = 1234
+      mock_restore.return_value = (mock_restored_trainer, jax.random.PRNGKey(0))
+
+      output = run_trainer(mock_trainer_config)
+
+      self.assertEqual(output, "success")
+      self.assertEqual(mock_sleep.call_count, 3)
+      
+      sleep_durations = [call[0][0] for call in mock_sleep.call_args_list]
+      self.assertEqual(sleep_durations, [1, 2, 4])
 
 
 if __name__ == "__main__":

@@ -3476,3 +3476,21 @@ py_test(
         "@axlearn_pip//numpy",
     ],
 )
+
+py_test(
+    name = "elastic_recovery_test",
+    srcs = ["elastic_recovery_test.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":config",
+        ":launch_trainer",
+        ":learner",
+        ":optimizers",
+        ":snapshot",
+        ":trainer",
+        ":utils",
+        "@axlearn_pip//absl_py",
+        "@axlearn_pip//jax",
+        "@axlearn_pip//numpy",
+    ],
+)
