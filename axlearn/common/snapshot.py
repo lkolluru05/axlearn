@@ -26,6 +26,9 @@ class Snapshotter:
     self._latest_snapshot: tuple[tree_types.PyTree, int] | None = None
     self._lock = threading.Lock()
     self._queue = queue.Queue(maxsize=1)
+    self._worker_busy = False
+    self._generation = 0
+    self._last_worker_error = None
     self.replica_axis_index = replica_axis_index
     self.trainer_state_specs = trainer_state_specs
     self._worker_thread = threading.Thread(target=self._worker, daemon=True)
@@ -37,8 +40,14 @@ class Snapshotter:
       if task is None:
         self._queue.task_done()
         break
-      pinned_state, step = task
-      _logger.info("[ELASTIC] Snapshot worker dequeued task for step %d", step)
+      pinned_state, step, task_generation, active_mesh = task
+      _logger.info("[ELASTIC] Snapshot worker dequeued task for step %d (gen %d)", step, task_generation)
+      with self._lock:
+        if task_generation != self._generation:
+          _logger.info("[ELASTIC] Skipping stale snapshot task for step %d (task gen %d != current gen %d)", step, task_generation, self._generation)
+          self._queue.task_done()
+          continue
+        self._worker_busy = True
       try:
         _logger.info(
             "[ELASTIC] [*] [Snapshot Thread] Waiting for snapshot at step %d to be ready...",
@@ -49,8 +58,37 @@ class Snapshotter:
             "[ELASTIC] [*] [Snapshot Thread] Snapshot at step %d is ready and secured.",
             step,
         )
+        old_snapshot = None
         with self._lock:
-          self._latest_snapshot = (pinned_state, step)
+          if task_generation == self._generation:
+            old_snapshot = self._latest_snapshot
+            self._latest_snapshot = (pinned_state, step)
+        
+        if old_snapshot is not None and isinstance(active_mesh, jax.sharding.Mesh):
+          old_state, old_step = old_snapshot
+          _logger.info("[ELASTIC] Selectively deleting old snapshot (step %d) shards on active mesh...", old_step)
+          deleted_shards_count = 0
+          ignored_shards_count = 0
+          
+          def selective_delete(x):
+              nonlocal deleted_shards_count, ignored_shards_count
+              if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
+                  for shard in x.addressable_shards:
+                      try:
+                          if shard.device in active_mesh.devices:
+                              shard.data.delete()
+                              deleted_shards_count += 1
+                          else:
+                              ignored_shards_count += 1
+                      except Exception:
+                          pass
+          
+          jax.tree.map(selective_delete, old_state)
+          _logger.info("[ELASTIC] Selective snapshot deletion complete. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
+          del old_state, old_snapshot
+          import gc
+          gc.collect()
+
       except Exception as e:  # pylint: disable=broad-except
         err_msg = "Unknown error"
         try:
@@ -62,7 +100,12 @@ class Snapshotter:
             step,
             err_msg,
         )
+        with self._lock:
+          if task_generation == self._generation:
+            self._last_worker_error = e
       finally:
+        with self._lock:
+          self._worker_busy = False
         _logger.info("[ELASTIC] Snapshot worker finished processing step %d", step)
         self._queue.task_done()
 
@@ -71,27 +114,10 @@ class Snapshotter:
   ) -> None:
     """Move arrays onto CPU worker devices."""
     _logger.info("[ELASTIC] Starting snapshot process for step %d", step)
-    if self._queue.full():
-      _logger.warning("[ELASTIC] Snapshotter busy. Skipping snapshot for step %d", step)
-      return
-
     with self._lock:
-      old_snapshot = self._latest_snapshot
-      self._latest_snapshot = None
-
-    if old_snapshot is not None:
-      old_state, _ = old_snapshot
-      _logger.info("[ELASTIC] Deleting old snapshot from Host RAM before allocating new one.")
-      
-      jax.tree.map(
-          lambda x: x.delete() if hasattr(x, "delete") else None,
-          old_state
-      )
-      
-      del old_state
-      del old_snapshot
-      import gc
-      gc.collect()
+      if self._queue.full() or self._worker_busy:
+        _logger.warning("[ELASTIC] Snapshotter busy. Skipping snapshot for step %d", step)
+        return
 
     _logger.info("[ELASTIC] Moving snapshot state to host-pinned memory for step %d...", step)
     pinned_shardings = jax.tree.map(
@@ -99,20 +125,42 @@ class Snapshotter:
     )
     pinned_state = jax.device_put(state, pinned_shardings)
     _logger.info("[ELASTIC] Snapshot state secured in host-pinned memory for step %d.", step)
-    self._queue.put((pinned_state, step))
+    mesh = get_current_abstract_or_physical_mesh()
+    self._queue.put((pinned_state, step, self._generation, mesh))
 
   def cancel_pending(self):
     """Clears any pending snapshot saves from the queue and resets the worker thread."""
     _logger.info("[ELASTIC] Canceling any pending snapshot saves and resetting worker thread.")
+    with self._lock:
+      self._last_worker_error = None
+      self._generation += 1
+
+    mesh = get_current_abstract_or_physical_mesh()
+    active_devices = mesh.devices if isinstance(mesh, jax.sharding.Mesh) else set()
+
     while not self._queue.empty():
         try:
             task = self._queue.get_nowait()
             if task is not None:
-                pinned_state, _ = task
-                jax.tree.map(
-                    lambda x: x.delete() if hasattr(x, "delete") else None,
-                    pinned_state
-                )
+                pinned_state = task[0]
+                
+                deleted_shards_count = 0
+                ignored_shards_count = 0
+                def selective_delete(x):
+                    nonlocal deleted_shards_count, ignored_shards_count
+                    if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
+                        for shard in x.addressable_shards:
+                            try:
+                                if shard.device in active_devices:
+                                    shard.data.delete()
+                                    deleted_shards_count += 1
+                                else:
+                                    ignored_shards_count += 1
+                            except Exception:
+                                pass
+                            
+                jax.tree.map(selective_delete, pinned_state)
+                _logger.info("[ELASTIC] Cancelled pending snapshot. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
             self._queue.task_done()
         except queue.Empty:
             break
@@ -145,6 +193,10 @@ class Snapshotter:
       RuntimeError: If no snapshots are available to restore from.
       ValueError: If `trainer_state_specs` is not provided during initialization.
     """
+    with self._lock:
+      if self._last_worker_error is not None:
+        raise self._last_worker_error
+
     self.cancel_pending()
     if abstract_state is None:
         if self.trainer_state_specs is None:
@@ -183,36 +235,81 @@ class Snapshotter:
     if not isinstance(mesh, jax.sharding.Mesh):
         raise RuntimeError(f"Expected a jax.sharding.Mesh, got {mesh}")
     
-    mesh_axis = mesh.axis_names[self.replica_axis_index]
-    _logger.info("[ELASTIC] Splitting snapshot along mesh axis %s to find valid replicas...", mesh_axis)
-    
-    replicas = split_by_mesh_axis.split_by_mesh_axis(
-        pinned_state, mesh_axis=mesh_axis
-    )
-    
-    valid_replicas = []
-    for idx, r in enumerate(replicas):
-        try:
-            # Validate host-pinned replica buffer directly
-            jax.tree.map(lambda x: jax.block_until_ready(x) if hasattr(x, "block_until_ready") else None, r)
-            _logger.info("[ELASTIC] Replica %d is valid on host.", idx)
-            valid_replicas.append(r)
-        except Exception as e:
-            _logger.warning("[ELASTIC] Replica %d failed validation: %s", idx, e)
-            
-    if not valid_replicas:
-        raise RuntimeError(f"No valid replicas found for snapshot at step {step}.")
-        
-    _logger.info("[ELASTIC] Found %d valid replicas.", len(valid_replicas))
-    
-    if len(valid_replicas) == 1:
-        _logger.info("[ELASTIC] Only 1 valid replica found. Skipping concatenation.")
-        reconstructed_state = valid_replicas[0]
-    else:
-        _logger.info("[ELASTIC] Concatenating valid replicas along axis %s...", mesh_axis)
-        reconstructed_state = concatenate_by_mesh_axis.concatenate_by_mesh_axis(
-            valid_replicas, mesh_axis=mesh_axis
-        )
+    def get_active_pytree(x, spec):
+      if not isinstance(x, jax.Array) or not hasattr(x.sharding, "mesh"):
+        return x
+
+      # Option 2 Fallback: Exact coordinate reconstruction via shard.index for JAX <=0.8.3 compatibility
+      if not hasattr(x, "addressable_shards") or not x.addressable_shards:
+          return x
+
+      # If the entire array fits inside one local addressable shard completely, return it directly!
+      if len(x.addressable_shards) == 1 and x.addressable_shards[0].data.shape == x.shape:
+          return x.addressable_shards[0].data
+
+      # Try to reconstruct using make_array_from_single_device_arrays to avoid client OOM
+      try:
+          target_sharding = getattr(spec, "sharding", None)
+          if target_sharding is not None and isinstance(target_sharding, jax.sharding.NamedSharding):
+              # Match the memory kind of input shards to avoid mismatch (typically pinned_host)
+              input_memory_kind = "pinned_host"
+              if x.addressable_shards:
+                  input_memory_kind = getattr(x.addressable_shards[0].data.sharding, "memory_kind", "pinned_host")
+              target_sharding = target_sharding.with_memory_kind(input_memory_kind)
+
+              healthy_device_to_array = {}
+              for shard in x.addressable_shards:
+                  try:
+                      # Verify buffer is alive
+                      jax.block_until_ready(shard.data)
+                      healthy_device_to_array[shard.device] = shard.data
+                  except jax.errors.JaxRuntimeError:
+                      pass  # Skip unresponsive shards
+
+              # Build the list of arrays matching target_sharding addressable_devices
+              arrays = []
+              success = True
+              for device in target_sharding.addressable_devices:
+                  if device in healthy_device_to_array:
+                      arrays.append(healthy_device_to_array[device])
+                  else:
+                      _logger.warning("[ELASTIC] Missing data for device %s during in-memory reconstruction", device)
+                      success = False
+                      break
+              
+              if success:
+                  res = jax.make_array_from_single_device_arrays(spec.shape, target_sharding, arrays)
+                  _logger.info("[ELASTIC] Successfully reconstructed array using make_array_from_single_device_arrays")
+                  return res
+      except Exception as make_arr_err:
+          _logger.warning("[ELASTIC] make_array_from_single_device_arrays failed (%s), falling back to client numpy reconstruction.", make_arr_err)
+
+      # Otherwise, safely rebuild the global tensor on host RAM from surviving healthy local shards
+      try:
+          import numpy as np
+          host_buf = np.zeros(x.shape, dtype=x.dtype)
+          has_valid_data = False
+
+          for shard in x.addressable_shards:
+              try:
+                  # Verify buffer is alive and addressable on local target chip/host
+                  jax.block_until_ready(shard.data)
+                  idx = getattr(shard, "index", None)
+                  if idx is not None:
+                      host_buf[idx] = np.asarray(shard.data)
+                      has_valid_data = True
+              except jax.errors.JaxRuntimeError:
+                  pass  # Skip unresponsive shards from dead slices
+
+          if has_valid_data:
+              return host_buf
+      except Exception as fallback_err:
+          _logger.warning("[ELASTIC] Host buffer coordinate assembly failed (%s), taking primitive shard fallback.", fallback_err)
+
+      return x
+
+    _logger.info("[ELASTIC] Extracting active replicas and addressable shards from pinned state...")
+    reconstructed_state = jax.tree.map(get_active_pytree, pinned_state, abstract_state)
         
     # Stage 1: Reshard on host to target mesh layout (keeping memory_kind as 'pinned_host')
     _logger.info("[ELASTIC] Stage 1: Resharding reconstructed state on host...")
@@ -230,7 +327,24 @@ class Snapshotter:
     jax.block_until_ready(restored_state)
     
     if reset_snapshot_state:
-        _logger.info("[ELASTIC] Resetting snapshot state to restored state in host-pinned memory...")
+        _logger.info("[ELASTIC] Resetting snapshot state. Selectively deleting old snapshot shards on active mesh...")
+        deleted_shards_count = 0
+        ignored_shards_count = 0
+        def selective_delete(x):
+            nonlocal deleted_shards_count, ignored_shards_count
+            if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
+                for shard in x.addressable_shards:
+                    try:
+                        if shard.device in mesh.devices:
+                            shard.data.delete()
+                            deleted_shards_count += 1
+                        else:
+                            ignored_shards_count += 1
+                    except Exception:
+                        pass
+        jax.tree.map(selective_delete, pinned_state)
+        _logger.info("[ELASTIC] Selective snapshot deletion complete. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
+        
         with self._lock:
             self._latest_snapshot = None
         import gc
@@ -248,6 +362,13 @@ class Snapshotter:
   def join(self) -> None:
     """Blocks until all snapshots in the queue are ready and secured."""
     self._queue.join()
+
+  def close(self) -> None:
+    """Signals the worker thread to exit and blocks until it finishes."""
+    if self._worker_thread is not None and self._worker_thread.is_alive():
+        self._queue.put(None)
+        self._worker_thread.join()
+        self._worker_thread = None
 
   @property
   def latest(self) -> training.CheckpointMetadata[None] | None:

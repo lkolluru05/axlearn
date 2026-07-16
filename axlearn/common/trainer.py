@@ -116,7 +116,20 @@ def sync_restore_class_vars(
             logging.warning("[ELASTIC] Failed to delete pre-existing physical arrays: %s", e)
 
     state_restored = False
-    snapshot_mgr = use_python_vars.get("snapshot_mgr")
+    latest_snapshot = use_python_vars.get("_latest_snapshot")
+    if latest_snapshot is not None:
+        logging.info("[ELASTIC] Found raw host-pinned _latest_snapshot. Instantiating fresh Snapshotter.")
+        replica_axis_idx = fresh_trainer.config.mesh_axis_names.index("data") if "data" in fresh_trainer.config.mesh_axis_names else 0
+        from axlearn.common.snapshot import Snapshotter
+        from axlearn.common.config import config_for_class
+        snapshot_cfg = config_for_class(Snapshotter).set(
+            replica_axis_index=replica_axis_idx,
+            trainer_state_specs=fresh_trainer._trainer_state_specs
+        )
+        snapshot_mgr = snapshot_cfg.instantiate()
+        snapshot_mgr._latest_snapshot = latest_snapshot
+    else:
+        snapshot_mgr = use_python_vars.get("snapshot_mgr")
     if snapshot_mgr is not None:
         with mesh:
             try:
@@ -152,13 +165,10 @@ def sync_restore_class_vars(
             logging.warning("[ELASTIC] [!] Failed fallback to globals (possibly deleted arrays): %s", e)
 
     if not state_restored:
-        logging.info("[ELASTIC] [!] Falling back to fresh init().")
-        with mesh:
-            fresh_trainer.init(jax.random.PRNGKey(seed=42))
-        if "_step" in use_immutable_data:
-            fresh_trainer._step = int(use_immutable_data["_step"])
-        elif "_step" in use_python_vars:
-            fresh_trainer._step = int(use_python_vars["_step"])
+        raise RuntimeError(
+            "Elastic recovery triggered but failed to restore state from snapshot or globals. "
+            "Failing job to prevent silent model corruption."
+        )
 
     if "_input_iter" in use_python_vars:
         fresh_trainer._input_iter = use_python_vars["_input_iter"]

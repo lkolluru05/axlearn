@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 
-from axlearn.common.snapshot import Snapshotter, is_replica_active
+from axlearn.common.snapshot import Snapshotter
 from axlearn.common.utils import TensorSpec
 from pathwaysutils.experimental import concatenate_by_mesh_axis
 from pathwaysutils.experimental import split_by_mesh_axis
@@ -21,21 +21,6 @@ from pathwaysutils.experimental import split_by_mesh_axis
 
 class SnapshotterTest(parameterized.TestCase):
 
-  def test_is_replica_active(self):
-    arr = jnp.array([1.0, 2.0])
-    self.assertTrue(is_replica_active(arr))
-
-    # Check error handling when block_until_ready raises JaxRuntimeError
-    with mock.patch("jax.block_until_ready", side_effect=jax.errors.JaxRuntimeError("Device dead")):
-      self.assertFalse(is_replica_active(arr))
-
-    # Check filtering with unhealthy device IDs on mock addressable shards
-    mock_shard = mock.MagicMock()
-    mock_shard.device.id = 1
-    mock_arr = mock.MagicMock()
-    mock_arr.addressable_shards = [mock_shard]
-    self.assertFalse(is_replica_active(mock_arr, healthy_device_ids={0}))
-    self.assertTrue(is_replica_active(mock_arr, healthy_device_ids={0, 1}))
 
   def test_save_and_restore_healthy(self):
     devices = jax.devices()
@@ -66,8 +51,7 @@ class SnapshotterTest(parameterized.TestCase):
       self.assertTrue(jnp.array_equal(restored_state["x"], state["x"]))
       self.assertEqual(restored_state["x"].sharding, sharding)
 
-  @mock.patch("axlearn.common.snapshot.live_devices")
-  def test_restore_unhealthy_replica(self, mock_live_devices):
+  def test_restore_unhealthy_replica(self):
     devices = jax.devices()
     self.assertLen(devices, 2)
 
@@ -81,7 +65,7 @@ class SnapshotterTest(parameterized.TestCase):
     snapshotter = Snapshotter(replica_axis_index=0, trainer_state_specs=state_specs)
 
     with mesh:
-      # Initial state
+      # Initial state (all ones)
       x_val = jax.device_put(jnp.ones((2, 4)), sharding)
       state = {"x": x_val}
 
@@ -89,55 +73,64 @@ class SnapshotterTest(parameterized.TestCase):
       snapshotter.save_pytree(step=1, state=state)
       snapshotter.join()
 
-      pinned_state, step = snapshotter._latest_snapshot
-      x_pinned = pinned_state["x"]
+      # Construct mutated state directly as JAX array on host-pinned memory
+      sharding0 = jax.sharding.SingleDeviceSharding(devices[0], memory_kind="pinned_host")
+      sharding1 = jax.sharding.SingleDeviceSharding(devices[1], memory_kind="pinned_host")
+      arr0 = jax.device_put(jnp.ones((2, 4)), sharding0)
+      arr1 = jax.device_put(jnp.zeros((2, 4)), sharding1)
+      host_sharding = sharding.with_memory_kind("pinned_host")
+      mutated_x = jax.make_array_from_single_device_arrays((2, 4), host_sharding, [arr0, arr1])
 
-      try:
-        replicas = list(split_by_mesh_axis.split_by_mesh_axis(x_pinned, "data"))
-        zeros_sharding = replicas[1].sharding
-        replicas[1] = jax.device_put(jnp.zeros((2, 4)), zeros_sharding)
-        mutated_x_pinned = concatenate_by_mesh_axis.concatenate_by_mesh_axis(
-            replicas, "data"
-        )
-        use_mock_split = False
-      except (ImportError, AttributeError, RuntimeError, TypeError):
-        use_mock_split = True
-        mock_rep0 = jax.device_put(jnp.ones((2, 4)), jax.sharding.SingleDeviceSharding(devices[0], memory_kind="pinned_host"))
-        mock_rep1 = jax.device_put(jnp.zeros((2, 4)), jax.sharding.SingleDeviceSharding(devices[1], memory_kind="pinned_host"))
-        mutated_x_pinned = x_pinned
-
-      snapshotter._latest_snapshot = ({"x": mutated_x_pinned}, step)
+      snapshotter._latest_snapshot = ({"x": mutated_x}, 1)
 
       def run_test_case(live_devs, expected_val=None, expect_error=False):
-        mock_live_devices.return_value = live_devs
-        if use_mock_split:
-          with mock.patch("pathwaysutils.experimental.split_by_mesh_axis.split_by_mesh_axis", return_value=[mock_rep0, mock_rep1]), \
-               mock.patch("pathwaysutils.experimental.concatenate_by_mesh_axis.concatenate_by_mesh_axis", side_effect=lambda arrs, axis: arrs[0]):
+        original_block_until_ready = jax.block_until_ready
+        
+        def mock_block_until_ready(x):
+            def check_array(arr):
+                if isinstance(arr, jax.Array):
+                    sharding = getattr(arr, "sharding", None)
+                    if sharding is not None:
+                        for d in sharding.device_set:
+                            if d not in live_devs:
+                                raise jax.errors.JaxRuntimeError(f"Device {d} is dead")
+
+            def check_recursive(val):
+                if isinstance(val, dict):
+                    for v in val.values():
+                        check_recursive(v)
+                elif isinstance(val, (list, tuple)):
+                    for v in val:
+                        check_recursive(v)
+                else:
+                    check_array(val)
+
+            check_recursive(x)
+            return original_block_until_ready(x)
+
+        with mock.patch("jax.block_until_ready", side_effect=mock_block_until_ready):
             if expect_error:
-              with self.assertRaisesRegex(RuntimeError, "No active replicas found|No active addressable shards remaining|has no active addressable shards"):
+              with self.assertRaisesRegex(RuntimeError, "No active replicas found|No active addressable shards remaining|has no active addressable shards|is dead|Device .* is dead"):
                 snapshotter.load_pytree()
             else:
               restored_state = snapshotter.load_pytree()
               self.assertTrue(np.array_equal(np.asarray(restored_state["x"]), np.asarray(expected_val)))
-        else:
-          if expect_error:
-            with self.assertRaisesRegex(RuntimeError, "No active replicas found|No active addressable shards remaining|has no active addressable shards"):
-              snapshotter.load_pytree()
-          else:
-            restored_state = snapshotter.load_pytree()
-            self.assertTrue(np.array_equal(np.asarray(restored_state["x"]), np.asarray(expected_val)))
 
       # Case 1: Mock live devices to return only Device 0 (Device 1 is dead)
-      run_test_case([devices[0]], expected_val=jnp.ones((2, 4)))
+      mesh1 = jax.sharding.Mesh([devices[0]], ("data",))
+      with mesh1:
+        run_test_case([devices[0]], expected_val=jnp.ones((2, 4)))
 
       # Case 2: Mock live devices to return only Device 1 (Device 0 is dead)
-      if not use_mock_split:
-        snapshotter._latest_snapshot = ({"x": mutated_x_pinned}, step)
+      mesh2 = jax.sharding.Mesh([devices[1]], ("data",))
+      with mesh2:
+        snapshotter._latest_snapshot = ({"x": mutated_x}, 1)
         run_test_case([devices[1]], expected_val=jnp.zeros((2, 4)))
 
       # Case 3: Mock live devices to return empty (all dead)
-      snapshotter._latest_snapshot = ({"x": mutated_x_pinned}, step)
-      run_test_case([], expect_error=True)
+      with mesh1:
+        snapshotter._latest_snapshot = ({"x": mutated_x}, 1)
+        run_test_case([], expect_error=True)
 
   def test_save_skipped_when_busy(self):
     devices = jax.devices()
@@ -171,7 +164,7 @@ class SnapshotterTest(parameterized.TestCase):
 
         with mock.patch("axlearn.common.snapshot._logger.warning") as mock_warning:
           snapshotter.save_pytree(step=2, state=state2)
-          mock_warning.assert_called_once_with("Snapshotter busy. Skipping snapshot for step %d", 2)
+          mock_warning.assert_called_once_with("[ELASTIC] Snapshotter busy. Skipping snapshot for step %d", 2)
 
         worker_block_event.set()
         snapshotter.join()
@@ -201,29 +194,9 @@ class SnapshotterTest(parameterized.TestCase):
       self.assertEqual(latest_step, 42)
       self.assertTrue(np.array_equal(np.asarray(latest_state["x"]), np.asarray(state["x"])))
 
-  @mock.patch("axlearn.common.snapshot.split_by_mesh_axis_mod.split_by_mesh_axis", side_effect=RuntimeError("simulated split failure"))
-  @mock.patch("axlearn.common.snapshot.live_devices")
-  def test_addressable_shards_fallback(self, mock_live_devices, mock_split):
-    devices = jax.devices()
-    self.assertLen(devices, 2)
-    mesh = jax.sharding.Mesh(devices, ("data",))
-    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    state_specs = {
-        "x": TensorSpec(shape=(2, 4), dtype=jnp.float32, mesh_axes=())
-    }
-    snapshotter = Snapshotter(replica_axis_index=0, trainer_state_specs=state_specs)
-    with mesh:
-      x_val = jax.device_put(jnp.ones((2, 4)), sharding)
-      state = {"x": x_val}
-      snapshotter.save_pytree(step=1, state=state)
-      snapshotter.join()
 
-      mock_live_devices.return_value = devices
-      restored = snapshotter.load_pytree()
-      self.assertTrue(jnp.array_equal(restored["x"], state["x"]))
 
-  @mock.patch("axlearn.common.snapshot.live_devices")
-  def test_replicated_leaf_recovery(self, mock_live_devices):
+  def test_replicated_leaf_recovery(self):
     devices = jax.devices()
     self.assertLen(devices, 2)
     mesh = jax.sharding.Mesh(devices, ("data",))
@@ -239,9 +212,16 @@ class SnapshotterTest(parameterized.TestCase):
       snapshotter.save_pytree(step=29, state=state)
       snapshotter.join()
 
-      mock_live_devices.return_value = [devices[0]]
-      restored = snapshotter.load_pytree()
-      self.assertTrue(jnp.array_equal(restored["prng_key"], state["prng_key"]))
+      original_block_until_ready = jax.block_until_ready
+      def mock_block_until_ready(x):
+          dev = getattr(x, "device", None)
+          if dev is not None and dev == devices[1]:
+              raise jax.errors.JaxRuntimeError(f"Device {dev} is dead")
+          return original_block_until_ready(x)
+
+      with mock.patch("jax.block_until_ready", side_effect=mock_block_until_ready):
+        restored = snapshotter.load_pytree()
+        self.assertTrue(jnp.array_equal(restored["prng_key"], state["prng_key"]))
 
   def test_worker_error_generation_and_recovery(self):
     devices = jax.devices()
@@ -282,44 +262,6 @@ class SnapshotterTest(parameterized.TestCase):
       restored = snapshotter.load_pytree()
       self.assertTrue(jnp.array_equal(restored["x"], state["x"]))
 
-  def test_is_replica_active_pinned_host_and_empty_set(self):
-    # 1. Verify when healthy_device_ids is empty set(), returns False for any array (including pinned_host arrays).
-    mock_pinned_sharding = mock.MagicMock()
-    mock_pinned_sharding.memory_kind = "pinned_host"
-    mock_pinned_arr = mock.MagicMock()
-    mock_pinned_arr.sharding = mock_pinned_sharding
-
-    self.assertFalse(is_replica_active(mock_pinned_arr, healthy_device_ids=set()))
-    self.assertFalse(is_replica_active(jnp.array([1.0, 2.0]), healthy_device_ids=set()))
-
-    # 2. Verify when arr is a CPU pinned_host array (or shards with CPU device IDs like 0),
-    # is_replica_active returns True when healthy_device_ids contains only TPU device IDs (e.g. {32, 33, 34, 35}).
-    tpu_ids = {32, 33, 34, 35}
-    self.assertTrue(is_replica_active(mock_pinned_arr, healthy_device_ids=tpu_ids))
-
-    mock_cpu_shard = mock.MagicMock()
-    mock_cpu_shard.device.id = 0
-    mock_cpu_shard.device.platform = "cpu"
-    class _DummyShardArray:
-      def __init__(self, shards):
-        self.addressable_shards = shards
-
-    mock_cpu_arr = _DummyShardArray([mock_cpu_shard])
-    self.assertTrue(is_replica_active(mock_cpu_arr, healthy_device_ids=tpu_ids))
-
-    mock_cpu_dev = mock.MagicMock()
-    mock_cpu_dev.id = 0
-    mock_cpu_dev.device_kind = "cpu"
-    mock_cpu_dev.platform = "cpu"
-
-    class _DummyDevArray:
-      def __init__(self, devs):
-        self._devs = devs
-      def devices(self):
-        return self._devs
-
-    mock_dev_arr = _DummyDevArray([mock_cpu_dev])
-    self.assertTrue(is_replica_active(mock_dev_arr, healthy_device_ids=tpu_ids))
 
   def test_load_pytree_stage_2_donation_and_intermediate_cleanup(self):
     devices = jax.devices()

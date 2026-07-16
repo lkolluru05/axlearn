@@ -2194,41 +2194,50 @@ def live_devices():
     device_list = jax.devices()
     if pathwaysutils is None or not hasattr(pathwaysutils, "is_pathways_backend_used") or not pathwaysutils.is_pathways_backend_used():
         return device_list
-    logging.info("[ELASTIC] pathwaysutils.is_pathways_backend_used(): %s", pathwaysutils.is_pathways_backend_used())
-    if pathwaysutils.is_pathways_backend_used():
-        elastic_manager = manager.Manager()
-        logging.info("[ELASTIC] elastic_manager: %s", elastic_manager)
-        import time
-        timeout_seconds = 300
-        poll_interval = 5
-        start_time = time.time()
-
-        while time.time() - start_time < timeout_seconds:
-            # Attempt to fetch fresh indices rather than relying on cached properties
-            try:
-                from pathwaysutils.elastic import elastic
-                active_slice_indices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
-                elastic_manager.active_slice_indices = active_slice_indices
-            except Exception:
-                active_slice_indices = elastic_manager.active_slice_indices
-                
-            active_devices = [
-                d for d in device_list if d is not None and getattr(d, "slice_index", 0) in active_slice_indices
-            ]
-            if active_devices:
-                logging.info("[ELASTIC] Found %d active devices across slices: %s", len(active_devices), active_slice_indices)
-                return sorted(active_devices, key=lambda d: (getattr(d, "slice_index", 0), getattr(d, "coords", ())))
-
-            logging.info("[ELASTIC] Waiting for active_slice_indices to be populated (elapsed: %.1fs)...", time.time() - start_time)
-            time.sleep(poll_interval)
-
-        # Do NOT return device_list when on Pathways if active_devices is empty after timeout!
-        raise RuntimeError(
-            f"[ELASTIC] Timed out after {timeout_seconds}s waiting for active devices from Pathways elastic manager. "
-            f"Active slice indices remained empty: {elastic_manager.active_slice_indices}"
-        )
-
+    
+    global elastic_manager
+    if elastic_manager is None:
+        logging.warning("[ELASTIC] elastic_manager is not initialized. Returning all devices.")
+        return device_list
+        
+    try:
+        from pathwaysutils.elastic import elastic
+        active_slice_indices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
+        elastic_manager.active_slice_indices = active_slice_indices
+    except Exception as e:
+        logging.warning("[ELASTIC] Failed to get active slice indices: %s. Falling back to cached values.", e)
+        active_slice_indices = getattr(elastic_manager, "active_slice_indices", set())
+        
+    active_devices = [
+        d for d in device_list if d is not None and getattr(d, "slice_index", 0) in active_slice_indices
+    ]
+    if active_devices:
+        return sorted(active_devices, key=lambda d: (getattr(d, "slice_index", 0), getattr(d, "coords", ())))
     return device_list
+
+
+def wait_for_slices(slice_count: int, timeout_seconds: int = 300):
+    if pathwaysutils is None or not hasattr(pathwaysutils, "is_pathways_backend_used") or not pathwaysutils.is_pathways_backend_used():
+        return
+    
+    logging.info("[ELASTIC] Waiting for at least %d slices to be active (timeout: %ds)...", slice_count, timeout_seconds)
+    try:
+        from pathwaysutils.elastic import elastic
+        elastic.wait_for_slices(slice_count=slice_count, timeout=timeout_seconds)
+        logging.info("[ELASTIC] Sufficient slices are active.")
+    except Exception as e:
+        logging.error("[ELASTIC] Timed out or failed waiting for slices to be active: %s", e)
+        raise RuntimeError(f"Failed to wait for active slices: {e}") from e
+
+
+def wait_for_all_devices(timeout_seconds: int = 300):
+    if pathwaysutils is None or not hasattr(pathwaysutils, "is_pathways_backend_used") or not pathwaysutils.is_pathways_backend_used():
+        return
+    
+    device_list = jax.devices()
+    expected_slices = len(set(getattr(d, "slice_index", 0) for d in device_list if d is not None))
+    wait_for_slices(slice_count=expected_slices, timeout_seconds=timeout_seconds)
+
 
 
 def live_slice_indices() -> set[int]:

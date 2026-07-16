@@ -454,7 +454,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
     def default_config(cls):
         cfg = super().default_config()
         return cfg.set(
-            inner=TPUReplicatedJob.default_config(),
+            inner=TPUReplicatedJob.default_config().set(host_network=True),
             colocated_python=PathwaysColocatedPythonPlugin.default_config(),
         )
 
@@ -466,6 +466,13 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         # Propagate pod_mutators to inner so TPUJobBuilder._build_pod() applies them.
         # Must set _config directly because self.config returns a deep copy.
         self._inner._config.pod_mutators = cfg.pod_mutators
+        if self._inner._config.env_vars is None:
+            self._inner._config.env_vars = {}
+        self._inner._config.env_vars.update({
+            "GRPC_VERBOSITY": "ERROR",
+            "GRPC_TRACE": "",
+            "TPU_STDERR_LOG_LEVEL": "3",
+        })
         self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
         if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:
             raise NotImplementedError(f"Missing system characteristics for {self._tpu_type}")
@@ -1171,9 +1178,10 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
     def default_config(cls):
         cfg = super().default_config()
         return cfg.set(
-            inner=TPULeaderWorkerTemplate.default_config(),
+            inner=TPULeaderWorkerTemplate.default_config().set(host_network=True),
             colocated_python=PathwaysColocatedPythonPlugin.default_config(),
         )
+
 
     def __init__(self, cfg: Config, *, bundler):
         super().__init__(cfg, bundler=bundler)
@@ -1185,6 +1193,13 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         # Propagate pod_mutators to inner so TPUJobBuilder._build_pod() applies them.
         # Must set _config directly because self.config returns a deep copy.
         self._inner._config.pod_mutators = cfg.pod_mutators
+        if self._inner._config.env_vars is None:
+            self._inner._config.env_vars = {}
+        self._inner._config.env_vars.update({
+            "GRPC_VERBOSITY": "ERROR",
+            "GRPC_TRACE": "",
+            "TPU_STDERR_LOG_LEVEL": "3",
+        })
 
         self._tpu_type = infer_tpu_type(cfg.inner.accelerator.instance_type)
         if self._tpu_type not in USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS:

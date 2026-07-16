@@ -15,9 +15,27 @@ from axlearn.common import file_system as fs
 from axlearn.common import measurement
 from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config, sync_restore_class_vars, sync_store_class_vars
-from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape, live_devices, set_elastic_manager
+from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape, live_devices, set_elastic_manager, wait_for_all_devices, wait_for_slices
+import numpy as np
 from pathwaysutils.elastic import manager, elastic
 from pathwaysutils.debug import watchdog
+
+# Monkeypatch to force log the internal pmap error
+try:
+    from pathwaysutils.elastic.elastic import DefaultSliceHealthChecker
+    orig_validate = DefaultSliceHealthChecker.validate
+    def debug_validate(self):
+        import logging as pylogging
+        try:
+            return orig_validate(self)
+        except Exception as e:
+            # Force WARNING level print so it bypasses ABSL log filters in GKE
+            pylogging.warning("[DIAGNOSTIC] Health check pmap failed with: %s", e, exc_info=True)
+            raise
+    DefaultSliceHealthChecker.validate = debug_validate
+    logging.info("[DIAGNOSTIC] Successfully monkeypatched DefaultSliceHealthChecker.validate")
+except Exception as e:
+    logging.warning("[DIAGNOSTIC] Failed to apply monkeypatch: %s", e)
 
 
 # Trainer-specific flags.
@@ -101,7 +119,7 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer(
     "trainer_log_every_n_steps",
-    None,
+    5,
     "Logging frequency for the loss value during training. If None, defaults to every 100 steps.",
 )
 flags.DEFINE_enum(
@@ -163,7 +181,8 @@ def get_trainer_config(
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
     if not is_pathways_proxy():
         #trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
-        trainer_config.mesh_shape = trainer_config.mesh_shape or (len(live_devices()), 1)
+        logging.info("JAX devices %s", jax.devices())
+        trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax_devices()), 1)
         if isinstance(trainer_config.mesh_shape, MeshShape):
             trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
@@ -214,6 +233,45 @@ def is_retryable_error(e: Exception) -> bool:
     return False
 
 
+def _cleanup_live_arrays(preserved_snapshot: Any):
+    active_array_ids = set()
+    if preserved_snapshot is not None:
+        try:
+            state = preserved_snapshot[0] if isinstance(preserved_snapshot, tuple) else preserved_snapshot
+            leaves = jax.tree_util.tree_leaves(state)
+            for leaf in leaves:
+                if isinstance(leaf, jax.Array):
+                    active_array_ids.add(id(leaf))
+        except Exception as e:
+            logging.warning("[ELASTIC] Failed to extract active array IDs from snapshot: %s", e)
+                
+    try:
+        client_cpu_devices = set(jax.local_devices(backend="cpu"))
+    except Exception:
+        client_cpu_devices = set()
+        
+    logging.info("[ELASTIC] Cleaning up live arrays, keeping snapshots and client-local CPU arrays...")
+    deleted_count = 0
+    for array in jax.live_arrays():
+        try:
+            if id(array) in active_array_ids:
+                continue
+            if hasattr(array.sharding, "memory_kind") and array.sharding.memory_kind == "pinned_host":
+                continue
+            try:
+                array_devs = set(array.devices())
+                if array_devs and array_devs.issubset(client_cpu_devices):
+                    continue
+            except Exception:
+                pass # Err on the side of deleting
+            
+            array.delete()
+            deleted_count += 1
+        except Exception as e:
+            logging.debug("[ELASTIC] Failed to delete array during cleanup: %s", e)
+    logging.info("[ELASTIC] Deleted %d temporary/remote arrays.", deleted_count)
+
+
 def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     measurement.record_event(measurement.Event.START_JOB)
     trainer_config_debug_string = trainer_config.debug_string()
@@ -233,6 +291,9 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 f,
             )
     
+    if elastic_snapshotting_enabled:
+        wait_for_all_devices()
+
     elastic_manager = None
     elastic_manager_initialized = False
 
@@ -264,7 +325,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             # Therefore, we MUST check `python_vars.get("snapshot_mgr") is not None or immutable_data or jax_device_state`
             # alongside `new_slice_event.is_set()`. Even if `new_slice_event.is_set()` is `False`, preserving any
             # snapshot manager or state triggers Phase 1 / Phase 2 recovery via `sync_restore_class_vars()`.
-            if (elastic_manager and elastic_manager.new_slice_event.is_set()) or python_vars.get("snapshot_mgr") is not None or immutable_data or jax_device_state:
+            if (elastic_manager and elastic_manager.new_slice_event.is_set()) or python_vars.get("_latest_snapshot") is not None or immutable_data or jax_device_state:
                 logging.info(
                     "[ELASTIC] [RECOVERY PHASE 1] Preserved state or new_slice_event detected after preemption/rescaling. "
                     "Initiating class variable and snapshot restoration onto clean trainer..."
@@ -308,11 +369,14 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 if trainer is not None:
                     jax_device_state = getattr(trainer, "_jax_device_state", {})
                     python_vars = getattr(trainer, "_python_vars", {})
-                    if hasattr(trainer, "snapshot_mgr"):
-                        # Preserve the Snapshotter instance in python_vars so its host-pinned memory
-                        # (_latest_snapshot) and queue survive across the mesh re-initialization.
-                        python_vars["snapshot_mgr"] = trainer.snapshot_mgr
-                        logging.info("[ELASTIC] Preserving Snapshotter instance in python_vars for subsequent recovery.")
+                    if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
+                        if hasattr(trainer.snapshot_mgr, "join"):
+                            trainer.snapshot_mgr.join()
+                        if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
+                            python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
+                            logging.info("[ELASTIC] Preserving raw _latest_snapshot in python_vars for subsequent recovery.")
+                        if hasattr(trainer.snapshot_mgr, "close"):
+                            trainer.snapshot_mgr.close()
                     immutable_data = getattr(trainer, "_immutable_data", {})
 
                     logging.info("[ELASTIC] Stripping physical mesh and compiled XLA executables from state to release HBM.")
@@ -327,18 +391,95 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     old_state = jax_device_state.pop("_trainer_state", None)
                     if old_state is not None:
                         jax.tree.map(lambda x: x.delete() if isinstance(x, jax.Array) and hasattr(x, "delete") else None, old_state)
+
+                    logging.info("[ELASTIC] Severing references on trainer object to break cycles...")
+                    trainer._compiled_train_step = None
+                    trainer._jit_train_step = None
+                    trainer._mesh = None
+
+                # Prune python_vars to break the _children -> _parent back-reference cycle.
+                clean_python_vars = {}
+                for k in ["_latest_snapshot", "_step", "_input_iter"]:
+                    if k in python_vars:
+                        clean_python_vars[k] = python_vars[k]
+                python_vars = clean_python_vars
                 
+                logging.info("[ELASTIC] Clearing JAX caches and live arrays before recovery attempt...")
+                jax.clear_caches()
+                _cleanup_live_arrays(python_vars.get("_latest_snapshot"))
+
                 # Clear old trainer objects and JAX caches to release TPU HBM and device handles.
                 # We keep the extracted state dictionaries above to restore onto the new mesh.
                 logging.info("[ELASTIC] Clearing old trainer references and running garbage collection...")
                 trainer = None
                 clean_trainer = None
                 gc.collect()
-                logging.info("[ELASTIC] Memory cleanup complete. Setting new_slice_event and waiting 10s before retry loop.")
+
+                def crawl_for_jax_arrays(obj, path, visited=None):
+                    logging.info("[ELASTIC_DEBUG] Crawling %s", path)
+                    if visited is None:
+                        visited = set()
+                    try:
+                        obj_id = id(obj)
+                    except Exception:
+                        return
+                    if obj_id in visited:
+                        return
+                    visited.add(obj_id)
+                    
+                    if isinstance(obj, jax.Array):
+                        try:
+                            s = getattr(obj, "sharding", None)
+                            if s is None and hasattr(obj, "devices"):
+                                s = obj.devices()
+                        except Exception as inner_e:
+                            s = f"error: {inner_e}"
+                        try:
+                            shape = getattr(obj, "shape", None)
+                        except Exception:
+                            shape = "error"
+                        logging.info("[ELASTIC_DEBUG] Found jax.Array at %s: shape=%s, sharding/devices=%s", path, shape, s)
+                        return
+                    
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            crawl_for_jax_arrays(v, f"{path}[{repr(k)}]", visited)
+                    elif isinstance(obj, (list, tuple, set, frozenset)):
+                        for i, v in enumerate(obj):
+                            crawl_for_jax_arrays(v, f"{path}[{i}]", visited)
+                    else:
+                        if hasattr(obj, "__dict__"):
+                            try:
+                                for k, v in vars(obj).items():
+                                    crawl_for_jax_arrays(v, f"{path}.{k}", visited)
+                            except Exception:
+                                pass
+                        
+                        if hasattr(type(obj), "__slots__"):
+                            try:
+                                slots = type(obj).__slots__
+                                if isinstance(slots, str):
+                                    slots = [slots]
+                                for k in slots:
+                                    if hasattr(obj, k):
+                                        crawl_for_jax_arrays(getattr(obj, k), f"{path}.{k}", visited)
+                            except Exception:
+                                pass
+
+                logging.info("[ELASTIC_DEBUG] Crawling python_vars for jax.Array...")
+                crawl_for_jax_arrays(python_vars, "python_vars")
+                logging.info("[ELASTIC_DEBUG] Crawling jax_device_state for jax.Array...")
+                crawl_for_jax_arrays(jax_device_state, "jax_device_state")
+                logging.info("[ELASTIC_DEBUG] Crawling immutable_data for jax.Array...")
+                crawl_for_jax_arrays(immutable_data, "immutable_data")
+
+                logging.info("[ELASTIC] Memory cleanup complete. Sleeping 50s to let worker DCN deadlines expire...")
+                time.sleep(50)
                 
                 if elastic_manager:
                     elastic_manager.new_slice_event.set()
-                time.sleep(10)
+                
+                wait_for_slices(1)
                 continue
             else:
                 logging.error("[ELASTIC] Caught non-retryable error: %s", e)

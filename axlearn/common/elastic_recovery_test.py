@@ -159,12 +159,12 @@ class ElasticRecoveryRegressionTest(parameterized.TestCase):
 
       self.assertEqual(output, "success")
       # Even though elastic_manager.new_slice_event.is_set() was False,
-      # sync_restore_class_vars MUST be called on the retry because python_vars['snapshot_mgr'] was preserved.
+      # sync_restore_class_vars MUST be called on the retry because python_vars['_latest_snapshot'] was preserved.
       mock_restore.assert_called_once()
       args, _ = mock_restore.call_args
       self.assertEqual(args[0], mock_clean_trainer)
-      self.assertIn("snapshot_mgr", args[2])  # python_vars argument
-      self.assertEqual(args[2]["snapshot_mgr"], mock_snapshot_mgr)
+      self.assertIn("_latest_snapshot", args[2])  # python_vars argument
+      self.assertEqual(args[2]["_latest_snapshot"], mock_snapshot_mgr._latest_snapshot)
 
   def test_sync_restore_class_vars_deletes_preexisting_physical_arrays(self):
     """Regression 5a: sync_restore_class_vars calls .delete() on pre-existing _trainer_state arrays."""
@@ -196,7 +196,7 @@ class ElasticRecoveryRegressionTest(parameterized.TestCase):
     call_order = []
     mock_array_1.delete.side_effect = lambda: call_order.append("delete_1")
     mock_array_2.delete.side_effect = lambda: call_order.append("delete_2")
-    mock_snapshot_mgr.load_pytree.side_effect = lambda: (call_order.append("load_pytree"), {"weights": mock.MagicMock()})[1]
+    mock_snapshot_mgr.load_pytree.side_effect = lambda *args, **kwargs: (call_order.append("load_pytree"), {"weights": mock.MagicMock()})[1]
 
     sync_restore_class_vars(
         mock_trainer,
