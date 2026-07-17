@@ -3,6 +3,7 @@
 """Manages asynchronous backups of JAX array states to pinned host memory."""
 
 from absl import logging
+import time
 import queue
 import threading
 from typing import Any, Optional
@@ -269,9 +270,20 @@ class Snapshotter:
               # Build the list of arrays matching target_sharding addressable_devices
               arrays = []
               success = True
-              for device in target_sharding.addressable_devices:
+              healthy_devices_list = list(healthy_device_to_array.keys())
+              for i, device in enumerate(target_sharding.addressable_devices):
                   if device in healthy_device_to_array:
                       arrays.append(healthy_device_to_array[device])
+                  elif healthy_devices_list:
+                      # Scale-up handling: Rebind healthy slice 0 shard to target device handle
+                      fallback_device = healthy_devices_list[i % len(healthy_devices_list)]
+                      src_shard = healthy_device_to_array[fallback_device]
+                      try:
+                          single_sharding = jax.sharding.SingleDeviceSharding(device).with_memory_kind("pinned_host")
+                          rebound_shard = jax.device_put(src_shard, single_sharding)
+                          arrays.append(rebound_shard)
+                      except Exception:
+                          arrays.append(src_shard)
                   else:
                       _logger.warning("[ELASTIC] Missing data for device %s during in-memory reconstruction", device)
                       success = False
@@ -279,7 +291,7 @@ class Snapshotter:
               
               if success:
                   res = jax.make_array_from_single_device_arrays(spec.shape, target_sharding, arrays)
-                  _logger.info("[ELASTIC] Successfully reconstructed array using make_array_from_single_device_arrays")
+                  _logger.info("[ELASTIC] Successfully reconstructed array using make_array_from_single_device_arrays (with replica fallback)")
                   return res
       except Exception as make_arr_err:
           _logger.warning("[ELASTIC] make_array_from_single_device_arrays failed (%s), falling back to client numpy reconstruction.", make_arr_err)
@@ -312,20 +324,26 @@ class Snapshotter:
     reconstructed_state = jax.tree.map(get_active_pytree, pinned_state, abstract_state)
         
     # Stage 1: Reshard on host to target mesh layout (keeping memory_kind as 'pinned_host')
+    t0_stage1 = time.perf_counter()
     _logger.info("[ELASTIC] Stage 1: Resharding reconstructed state on host...")
     host_target_shardings = jax.tree.map(
         lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") and x.sharding is not None else None, abstract_state
     )
     host_target_state = jax.device_put(reconstructed_state, host_target_shardings)
     jax.block_until_ready(host_target_state)
+    stage1_time = time.perf_counter() - t0_stage1
+    _logger.info("[ELASTIC] [TIMING] Stage 1 Host Resharding took %.3f seconds", stage1_time)
 
     # Stage 2: Move from host back to device (TPU) memory
+    t0_stage2 = time.perf_counter()
     _logger.info("[ELASTIC] Stage 2: Moving state to TPU device memory...")
     device_target_shardings = jax.tree.map(
         lambda x: x.sharding.with_memory_kind("device") if hasattr(x, "sharding") and x.sharding is not None else None, abstract_state
     )
     restored_state = jax.device_put(host_target_state, device_target_shardings)
     jax.block_until_ready(restored_state)
+    stage2_time = time.perf_counter() - t0_stage2
+    _logger.info("[ELASTIC] [TIMING] Stage 2 TPU Device Loading took %.3f seconds", stage2_time)
     
     if reset_snapshot_state:
         _logger.info("[ELASTIC] Resetting snapshot state. Selectively deleting old snapshot shards on active mesh...")

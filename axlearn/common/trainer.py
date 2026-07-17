@@ -139,7 +139,10 @@ def sync_restore_class_vars(
                 )
                 snapshot_mgr.trainer_state_specs = fresh_trainer._trainer_state_specs
                 fresh_trainer._trainer_state = restored_trainer_state
+                t0_barrier = time.perf_counter()
                 jax.block_until_ready(fresh_trainer._trainer_state)
+                barrier_time = time.perf_counter() - t0_barrier
+                logging.info("[ELASTIC] [TIMING] Hardware Placement Barrier took %.3f seconds", barrier_time)
                 if getattr(snapshot_mgr, "latest", None) is not None:
                     try:
                         fresh_trainer._step = int(snapshot_mgr.latest.step)
@@ -989,6 +992,13 @@ class SpmdTrainer(Module):
                                 )
                                 self._step_log("[ELASTIC] Done step")
                                 logging.info("[ELASTIC] Done step %s", self.step)
+
+                                from axlearn.common.utils import get_elastic_manager, ScaleUpSignal
+                                em = get_elastic_manager()
+                                if em and em.new_slice_event.is_set():
+                                    self._step_log("[ELASTIC] Scale-up event detected! Cleanly exiting run loop for scale-up expansion...")
+                                    return ScaleUpSignal()
+
                                 if self.step % 5 == 0:
                                     self._jax_device_state, self._python_vars, self._immutable_data = sync_store_class_vars(self)
         
