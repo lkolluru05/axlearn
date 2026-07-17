@@ -317,6 +317,7 @@ class Snapshotter:
         lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") and x.sharding is not None else None, abstract_state
     )
     host_target_state = jax.device_put(reconstructed_state, host_target_shardings)
+    jax.block_until_ready(host_target_state)
 
     # Stage 2: Move from host back to device (TPU) memory
     _logger.info("[ELASTIC] Stage 2: Moving state to TPU device memory...")
@@ -346,16 +347,9 @@ class Snapshotter:
         _logger.info("[ELASTIC] Selective snapshot deletion complete. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
         
         with self._lock:
-            self._latest_snapshot = None
+            self._latest_snapshot = (host_target_state, step)
         import gc
         gc.collect()
-        
-        host_target_shardings = jax.tree.map(
-            lambda x: x.sharding.with_memory_kind("pinned_host") if hasattr(x, "sharding") and x.sharding is not None else None, restored_state
-        )
-        host_target_state = jax.device_put(restored_state, host_target_shardings)
-        with self._lock:
-            self._latest_snapshot = (host_target_state, step)
             
     return restored_state
 

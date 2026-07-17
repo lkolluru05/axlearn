@@ -139,6 +139,7 @@ def sync_restore_class_vars(
                 )
                 snapshot_mgr.trainer_state_specs = fresh_trainer._trainer_state_specs
                 fresh_trainer._trainer_state = restored_trainer_state
+                jax.block_until_ready(fresh_trainer._trainer_state)
                 if getattr(snapshot_mgr, "latest", None) is not None:
                     try:
                         fresh_trainer._step = int(snapshot_mgr.latest.step)
@@ -159,6 +160,7 @@ def sync_restore_class_vars(
                     use_jax_state["_trainer_state"],
                     fresh_trainer._trainer_state_specs
                 )
+                jax.block_until_ready(fresh_trainer._trainer_state)
                 logging.info("[ELASTIC] [✓] Successfully device_put trainer_state from globals onto the new mesh.")
                 state_restored = True
         except Exception as e:
@@ -170,8 +172,6 @@ def sync_restore_class_vars(
             "Failing job to prevent silent model corruption."
         )
 
-    if "_input_iter" in use_python_vars:
-        fresh_trainer._input_iter = use_python_vars["_input_iter"]
     fresh_trainer.snapshot_mgr = snapshot_mgr
     fresh_trainer._is_restored = state_restored
     fresh_trainer._compiled_train_step = None

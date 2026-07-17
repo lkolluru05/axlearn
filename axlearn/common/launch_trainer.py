@@ -302,6 +302,8 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     python_vars = {}
     immutable_data = {}
     trainer = None
+    last_successful_step = -1
+    consecutive_failures = 0
     logging.info("[ELASTIC] Starting elastic training loop cycle.")
     while True:
         try:
@@ -399,7 +401,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
 
                 # Prune python_vars to break the _children -> _parent back-reference cycle.
                 clean_python_vars = {}
-                for k in ["_latest_snapshot", "_step", "_input_iter"]:
+                for k in ["_latest_snapshot", "_step"]:
                     if k in python_vars:
                         clean_python_vars[k] = python_vars[k]
                 python_vars = clean_python_vars
@@ -473,8 +475,29 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 logging.info("[ELASTIC_DEBUG] Crawling immutable_data for jax.Array...")
                 crawl_for_jax_arrays(immutable_data, "immutable_data")
 
-                logging.info("[ELASTIC] Memory cleanup complete. Sleeping 50s to let worker DCN deadlines expire...")
-                time.sleep(50)
+                current_step = -1
+                if trainer is not None:
+                    try:
+                        current_step = int(trainer.step)
+                    except Exception:
+                        pass
+                if current_step == -1:
+                    current_step = int(python_vars.get("_step", -1))
+                if current_step == -1:
+                    current_step = int(immutable_data.get("_step", -1))
+
+                if current_step > last_successful_step:
+                    last_successful_step = current_step
+                    consecutive_failures = 1
+                else:
+                    consecutive_failures += 1
+
+                backoff_delay = min(15, 2 ** (consecutive_failures - 1))
+                logging.info(
+                    "[ELASTIC] Memory cleanup complete. Sleeping %ds (backoff delay, consecutive failures: %d) before re-instantiating...",
+                    backoff_delay, consecutive_failures
+                )
+                time.sleep(backoff_delay)
                 
                 if elastic_manager:
                     elastic_manager.new_slice_event.set()
