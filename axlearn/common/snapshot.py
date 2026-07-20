@@ -233,6 +233,8 @@ class Snapshotter:
       if len(x.addressable_shards) == 1 and x.addressable_shards[0].data.shape == x.shape:
           return x.addressable_shards[0].data
 
+      current_active_devices = set(mesh.devices) if isinstance(mesh, jax.sharding.Mesh) else set(jax.devices())
+
       # Try to reconstruct using make_array_from_single_device_arrays to avoid client OOM
       try:
           target_sharding = getattr(spec, "sharding", None)
@@ -243,7 +245,6 @@ class Snapshotter:
                   input_memory_kind = getattr(x.addressable_shards[0].data.sharding, "memory_kind", "pinned_host")
               target_sharding = target_sharding.with_memory_kind(input_memory_kind)
 
-              current_active_devices = set(mesh.devices) if isinstance(mesh, jax.sharding.Mesh) else set(jax.devices())
               healthy_device_to_array = {}
               for shard in x.addressable_shards:
                   if shard.device in current_active_devices:
@@ -277,7 +278,8 @@ class Snapshotter:
                       break
               
               if success:
-                  res = jax.make_array_from_single_device_arrays(spec.shape, target_sharding, arrays)
+                  target_shape = tuple(spec.shape) if hasattr(spec.shape, "__iter__") else spec.shape
+                  res = jax.make_array_from_single_device_arrays(target_shape, target_sharding, arrays)
                   _logger.info("[ELASTIC] Successfully reconstructed array using make_array_from_single_device_arrays (with replica fallback)")
                   return res
       except Exception as make_arr_err:
