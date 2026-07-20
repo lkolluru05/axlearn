@@ -23,23 +23,6 @@ import numpy as np
 from pathwaysutils.elastic import manager, elastic
 from pathwaysutils.debug import watchdog
 
-# Monkeypatch to force log the internal pmap error
-try:
-    from pathwaysutils.elastic.elastic import DefaultSliceHealthChecker
-    orig_validate = DefaultSliceHealthChecker.validate
-    def debug_validate(self):
-        import logging as pylogging
-        try:
-            return orig_validate(self)
-        except Exception as e:
-            # Force WARNING level print so it bypasses ABSL log filters in GKE
-            pylogging.warning("[DIAGNOSTIC] Health check pmap failed with: %s", e, exc_info=True)
-            raise
-    DefaultSliceHealthChecker.validate = debug_validate
-    logging.info("[DIAGNOSTIC] Successfully monkeypatched DefaultSliceHealthChecker.validate")
-except Exception as e:
-    logging.warning("[DIAGNOSTIC] Failed to apply monkeypatch: %s", e)
-
 
 # Trainer-specific flags.
 flags.DEFINE_string(
@@ -183,9 +166,7 @@ def get_trainer_config(
         select_mesh_config(trainer_config, mesh_selector=flag_values.mesh_selector)
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
     if not is_pathways_proxy():
-        #trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
-        logging.info("JAX devices %s", jax.devices())
-        trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax_devices()), 1)
+        trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
         if isinstance(trainer_config.mesh_shape, MeshShape):
             trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
@@ -397,8 +378,8 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     jax_device_state = getattr(trainer, "_jax_device_state", {})
                     python_vars = getattr(trainer, "_python_vars", {})
                     if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
-                        if hasattr(trainer.snapshot_mgr, "join"):
-                            trainer.snapshot_mgr.join()
+                        if hasattr(trainer.snapshot_mgr, "cancel_pending"):
+                            trainer.snapshot_mgr.cancel_pending()
                         if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
                             python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
                             logging.info("[ELASTIC] Preserving raw _latest_snapshot in python_vars for scale-up recovery.")
@@ -466,8 +447,8 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     jax_device_state = getattr(trainer, "_jax_device_state", {})
                     python_vars = getattr(trainer, "_python_vars", {})
                     if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
-                        if hasattr(trainer.snapshot_mgr, "join"):
-                            trainer.snapshot_mgr.join()
+                        if hasattr(trainer.snapshot_mgr, "cancel_pending"):
+                            trainer.snapshot_mgr.cancel_pending()
                         if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
                             python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
                             logging.info("[ELASTIC] Preserving raw _latest_snapshot in python_vars for subsequent recovery.")
