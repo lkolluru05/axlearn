@@ -45,6 +45,8 @@ from jax._src import sharding as jsharding
 from jax._src.mesh import thread_resources
 from jax.sharding import PartitionSpec
 
+from absl import logging
+
 from axlearn.common import input_base
 from axlearn.common.config import REQUIRED, Required, config_class, maybe_set_config
 from axlearn.common.input_dispatch import BaseInputDispatcher, _validate_logical_feed_shapes
@@ -72,23 +74,9 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
 
     @property
     def is_in_elastic_mode(self) -> bool:
-        print("In is_in_elastic_mode by lkolluru")
-        cfg = self.config
-        print("cfg.num_max_slices by lkolluru: ", cfg.num_max_slices)
-        print("slice_count by lkolluru: ", slice_count())
-        if cfg.num_max_slices is None:
+        if self.config.num_max_slices is None:
             return False
-        else:
-            if slice_count() < cfg.num_max_slices:
-                return True
-            elif slice_count() >= cfg.num_max_slices:
-                return False
-            else:
-                # TODO (jtian22): consider supporting scaling up in the future.
-                raise ValueError(
-                    f"The number of slices at runtime[{slice_count()}] is larger"
-                    f"than the configured num_max_slices[{cfg.num_max_slices}]!"
-                )
+        return slice_count() < self.config.num_max_slices
 
     def __init__(self, cfg: Config, *, parent: Optional[Module]):
         super().__init__(cfg, parent=parent)
@@ -159,10 +147,7 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
 
         self.feed_count = len(set(pid2fid.values())) // slice_count() * cfg.num_max_slices
         self.feed_index = pid2fid[jax.process_index()]
-        print("feed_count by lkolluru: ", self.feed_count)
-        print("global_logical_batch_size by lkolluru: ", cfg.global_logical_batch_size)
 
-        # assert cfg.global_logical_batch_size % self.feed_count == 0
         if self.feed_count == 0:
             self._feed_logical_batch_size = cfg.global_logical_batch_size
         else:
@@ -171,18 +156,13 @@ class ElasticSpmdInputDispatcher(BaseInputDispatcher):
         adjusted_device_physical_batch_size = math.ceil(
             self._device_physical_batch_size * (cfg.num_max_slices / slice_count())
         )
-        print(
-            "adjusted_device_physical_batch_size outside elastic by lkolluru: ",
-            adjusted_device_physical_batch_size,
-        )
 
         if self.is_in_elastic_mode:
-            print(" In elastic mode lkolluru")
             adjusted_device_physical_batch_size = math.ceil(
                 self._device_physical_batch_size * (cfg.num_max_slices / slice_count())
             )
-            print(
-                "adjusted_device_physical_batch_size inside elastic by lkolluru: ",
+            logging.info(
+                "[ELASTIC] adjusted_device_physical_batch_size: %s",
                 adjusted_device_physical_batch_size,
             )
             padding_per_device = (
@@ -423,13 +403,6 @@ class ElasticInput(input_base.Input):
 
 def slice_count() -> int:
     """Returns the number of slices."""
-    # slice_cnt_val=len(set(d.slice_index for d in jax.devices() if hasattr(d, "slice_index"))) or 1
-    # print("slice_count by lkolluru: ", slice_cnt_val)
-    # return len(set(d.slice_index for d in jax.devices() if hasattr(d, "slice_index"))) or 1
-    slice_cnt_val = (
-        len(set(d.slice_index for d in live_devices() if hasattr(d, "slice_index"))) or 1
-    )
-    print("slice_count by lkolluru: ", slice_cnt_val)
     return len(set(d.slice_index for d in live_devices() if hasattr(d, "slice_index"))) or 1
 
 
@@ -439,7 +412,6 @@ def process_count_per_slice() -> int:
         len(
             set(
                 d.process_index
-                # for d in jax.devices()
                 for d in live_devices()
                 if hasattr(d, "slice_index") and d.slice_index == 0
             )
@@ -531,8 +503,6 @@ def get_process_index_and_count_and_mapping(
     # compatible with any mesh with num_devices.
     device_map = tensor_sharding.devices_indices_map((tensor_sharding.num_devices,) * ndims)
 
-    print("device_map by lkolluru: ", device_map)
-
     # Get the slices for 'dim' for all devices.
     global_slice = {k: v[dim] for k, v in device_map.items()}
 
@@ -547,14 +517,10 @@ def get_process_index_and_count_and_mapping(
         process_to_slice[d.process_index].add(key)
         all_slices.add(key)
 
-    print("process_to_slice by lkolluru: ", process_to_slice)
-
     # Get the set of slices for the current process which we will use to compute
     # the index of the current process.
     current_pid = next(iter(tensor_sharding.addressable_devices)).process_index
     addressable_slices = frozenset(process_to_slice[current_pid])
-
-    print("addressable_slices by lkolluru: ", addressable_slices)
 
     # Verify that all processes have the same number of slices.
     slices_per_process = len(addressable_slices)
@@ -564,7 +530,6 @@ def get_process_index_and_count_and_mapping(
             "different number of slices."
         )
     unique_processes = list({frozenset(x) for x in process_to_slice.values()})
-    print("unique_processes by lkolluru: ", unique_processes)
 
     # After removing duplicate processes all unique slices should
     # cover the dimension exactly once. If they don't it means that
@@ -573,11 +538,8 @@ def get_process_index_and_count_and_mapping(
         raise NonUniformShardingError(f"{tensor_sharding=} is non-uniform on {dim=}")
     feed_index, feed_count = (unique_processes.index(addressable_slices), len(unique_processes))
 
-    # !!! patch begin
     pid2fid = {}
     for pid, _ in process_to_slice.items():
-        print("pid by lkolluru: ", pid)
         pid2fid[pid] = unique_processes.index(frozenset(process_to_slice[pid]))
-    # !!! patch end
-    print("pid2fid by lkolluru: ", pid2fid)
+
     return feed_index, feed_count, pid2fid

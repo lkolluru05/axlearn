@@ -495,7 +495,6 @@ class TPUJobBuilder(SingleReplicatedJob):
                 this is initialized from the environment variable in from_flags().
             shared_memory_size_gb: Size limit in GiB for the /dev/shm shared memory volume
                 (e.g. 500 for 500Gi). Setting it to 0 means unlimited.
-            host_network: Whether to use host network for the pods.
         """
 
         reservation: Optional[str] = None
@@ -509,7 +508,6 @@ class TPUJobBuilder(SingleReplicatedJob):
         job_labels: Optional[dict[str, str]] = None
         topology_assignment: Optional[list[list[str]]] = None
         shared_memory_size_gb: Optional[int] = None
-        host_network: Optional[bool] = None
 
     @classmethod
     def define_flags(cls, fv: flags.FlagValues):
@@ -546,24 +544,10 @@ class TPUJobBuilder(SingleReplicatedJob):
             "Limit /dev/shm to this size in GiB (e.g. 500). 0 means unlimited.",
             **common_kwargs,
         )
-        flags.DEFINE_boolean(
-            "host_network",
-            None,
-            "Whether to use host network for the pods.",
-            **common_kwargs,
-        )
 
     @classmethod
     def from_flags(cls, fv: flags.FlagValues, **kwargs) -> Config:
-        prebuilt_cfg = kwargs.get("prebuilt_cfg")
-        existing_host_network = prebuilt_cfg.host_network if prebuilt_cfg else None
-
         cfg: TPUJobBuilder.Config = super().from_flags(fv, **kwargs)
-
-        if fv.host_network is not None:
-            cfg.host_network = fv.host_network
-        elif existing_host_network is not None:
-            cfg.host_network = existing_host_network
 
         default_env = get_default_env(
             tpu_type=infer_tpu_type(fv.instance_type),
@@ -1060,9 +1044,10 @@ class TPUJobBuilder(SingleReplicatedJob):
             volumes=volumes,
         )
 
-        if cfg.host_network:
-            spec["hostNetwork"] = True
-            spec["dnsPolicy"] = "ClusterFirstWithHostNet"
+        # Pathways elastic training on GKE multi-slice TPU clusters requires direct host networking
+        # for cross-slice gRPC health checks (DefaultSliceHealthChecker) and maximum DCN bandwidth.
+        spec["hostNetwork"] = True
+        spec["dnsPolicy"] = "ClusterFirstWithHostNet"
 
         if cfg.priority_class:
             spec["priorityClassName"] = cfg.priority_class
