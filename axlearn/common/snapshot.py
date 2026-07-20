@@ -243,14 +243,16 @@ class Snapshotter:
                   input_memory_kind = getattr(x.addressable_shards[0].data.sharding, "memory_kind", "pinned_host")
               target_sharding = target_sharding.with_memory_kind(input_memory_kind)
 
+              current_active_devices = set(mesh.devices) if isinstance(mesh, jax.sharding.Mesh) else set(jax.devices())
               healthy_device_to_array = {}
               for shard in x.addressable_shards:
-                  try:
-                      # Verify buffer is alive
-                      jax.block_until_ready(shard.data)
-                      healthy_device_to_array[shard.device] = shard.data
-                  except jax.errors.JaxRuntimeError:
-                      pass  # Skip unresponsive shards
+                  if shard.device in current_active_devices:
+                      try:
+                          # Verify buffer is alive on active device
+                          jax.block_until_ready(shard.data)
+                          healthy_device_to_array[shard.device] = shard.data
+                      except (jax.errors.JaxRuntimeError, Exception):
+                          pass  # Skip unresponsive shards
 
               # Build the list of arrays matching target_sharding addressable_devices
               arrays = []
@@ -288,15 +290,16 @@ class Snapshotter:
           has_valid_data = False
 
           for shard in x.addressable_shards:
-              try:
-                  # Verify buffer is alive and addressable on local target chip/host
-                  jax.block_until_ready(shard.data)
-                  idx = getattr(shard, "index", None)
-                  if idx is not None:
-                      host_buf[idx] = np.asarray(shard.data)
-                      has_valid_data = True
-              except jax.errors.JaxRuntimeError:
-                  pass  # Skip unresponsive shards from dead slices
+              if shard.device in current_active_devices:
+                  try:
+                      # Verify buffer is alive and addressable on local target chip/host
+                      jax.block_until_ready(shard.data)
+                      idx = getattr(shard, "index", None)
+                      if idx is not None:
+                          host_buf[idx] = np.asarray(shard.data)
+                          has_valid_data = True
+                  except (jax.errors.JaxRuntimeError, Exception):
+                      pass  # Skip unresponsive shards from dead slices
 
           if has_valid_data:
               return host_buf
