@@ -379,6 +379,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     python_vars = getattr(trainer, "_python_vars", {})
                     if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
                         if hasattr(trainer.snapshot_mgr, "cancel_pending"):
+                            logging.info("[ELASTIC] Invoking snapshot_mgr.cancel_pending() to abort in-flight transfers...")
                             trainer.snapshot_mgr.cancel_pending()
                         if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
                             python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
@@ -448,6 +449,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     python_vars = getattr(trainer, "_python_vars", {})
                     if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
                         if hasattr(trainer.snapshot_mgr, "cancel_pending"):
+                            logging.info("[ELASTIC] Invoking snapshot_mgr.cancel_pending() to abort in-flight transfers...")
                             trainer.snapshot_mgr.cancel_pending()
                         if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
                             python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
