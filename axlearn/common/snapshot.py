@@ -136,35 +136,20 @@ class Snapshotter:
       self._last_worker_error = None
       self._generation += 1
 
-    mesh = get_current_abstract_or_physical_mesh()
-    active_devices = mesh.devices if isinstance(mesh, jax.sharding.Mesh) else set()
-
+    cancelled_count = 0
     while not self._queue.empty():
         try:
             task = self._queue.get_nowait()
             if task is not None:
-                pinned_state = task[0]
-                
-                deleted_shards_count = 0
-                ignored_shards_count = 0
-                def selective_delete(x):
-                    nonlocal deleted_shards_count, ignored_shards_count
-                    if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
-                        for shard in x.addressable_shards:
-                            try:
-                                if shard.device in active_devices:
-                                    shard.data.delete()
-                                    deleted_shards_count += 1
-                                else:
-                                    ignored_shards_count += 1
-                            except Exception:
-                                pass
-                            
-                jax.tree.map(selective_delete, pinned_state)
-                _logger.info("[ELASTIC] Cancelled pending snapshot. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
+                del task
+                cancelled_count += 1
             self._queue.task_done()
         except queue.Empty:
             break
+            
+    import gc
+    gc.collect()
+    _logger.info("[ELASTIC] Cancelled %d pending snapshot tasks and cleared CPU host RAM.", cancelled_count)
             
     self._queue.put(None)
     self._worker_thread.join()
