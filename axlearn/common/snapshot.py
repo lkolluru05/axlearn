@@ -233,7 +233,7 @@ class Snapshotter:
       if len(x.addressable_shards) == 1 and x.addressable_shards[0].data.shape == x.shape:
           return x.addressable_shards[0].data
 
-      current_active_devices = set(mesh.devices) if isinstance(mesh, jax.sharding.Mesh) else set(jax.devices())
+      active_device_ids = {d.id for d in mesh.devices} if isinstance(mesh, jax.sharding.Mesh) else {d.id for d in jax.devices()}
 
       # Try to reconstruct using make_array_from_single_device_arrays to avoid client OOM
       try:
@@ -247,25 +247,25 @@ class Snapshotter:
 
               healthy_device_to_array = {}
               for shard in x.addressable_shards:
-                  if shard.device in current_active_devices:
+                  if shard.device.id in active_device_ids:
                       try:
                           # Verify buffer is alive on active device
                           jax.block_until_ready(shard.data)
-                          healthy_device_to_array[shard.device] = shard.data
+                          healthy_device_to_array[shard.device.id] = shard.data
                       except (jax.errors.JaxRuntimeError, Exception):
                           pass  # Skip unresponsive shards
 
               # Build the list of arrays matching target_sharding addressable_devices
               arrays = []
               success = True
-              healthy_devices_list = list(healthy_device_to_array.keys())
+              healthy_device_ids_list = list(healthy_device_to_array.keys())
               for i, device in enumerate(target_sharding.addressable_devices):
-                  if device in healthy_device_to_array:
-                      arrays.append(healthy_device_to_array[device])
-                  elif healthy_devices_list:
+                  if device.id in healthy_device_to_array:
+                      arrays.append(healthy_device_to_array[device.id])
+                  elif healthy_device_ids_list:
                       # Scale-up handling: Rebind healthy slice 0 shard to target device handle
-                      fallback_device = healthy_devices_list[i % len(healthy_devices_list)]
-                      src_shard = healthy_device_to_array[fallback_device]
+                      fallback_id = healthy_device_ids_list[i % len(healthy_device_ids_list)]
+                      src_shard = healthy_device_to_array[fallback_id]
                       try:
                           single_sharding = jax.sharding.SingleDeviceSharding(device).with_memory_kind("pinned_host")
                           rebound_shard = jax.device_put(src_shard, single_sharding)
@@ -292,7 +292,7 @@ class Snapshotter:
           has_valid_data = False
 
           for shard in x.addressable_shards:
-              if shard.device in current_active_devices:
+              if shard.device.id in active_device_ids:
                   try:
                       # Verify buffer is alive and addressable on local target chip/host
                       jax.block_until_ready(shard.data)
