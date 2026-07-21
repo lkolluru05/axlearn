@@ -6,7 +6,7 @@ from absl import logging
 import time
 import queue
 import threading
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from etils import epath
 import jax
@@ -22,6 +22,31 @@ _logger = logging
 
 class Snapshotter:
   """Manages asynchronous backups of JAX array states to pinned host memory."""
+
+  @staticmethod
+  def _selective_delete_pytree(pytree: Any, active_devices: Iterable[Any]) -> tuple[int, int]:
+      """Deletes shards in pytree that reside on active_devices, skipping inactive devices."""
+      deleted_count = 0
+      ignored_count = 0
+      if active_devices is None:
+          return 0, 0
+
+      def selective_delete(x):
+          nonlocal deleted_count, ignored_count
+          if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
+              for shard in x.addressable_shards:
+                  try:
+                      if shard.device in active_devices:
+                          shard.data.delete()
+                          deleted_count += 1
+                      else:
+                          ignored_count += 1
+                  except Exception:
+                      pass
+
+      if pytree is not None:
+          jax.tree.map(selective_delete, pytree)
+      return deleted_count, ignored_count
 
   def __init__(self, *, replica_axis_index: int = 0, trainer_state_specs: Optional[Nested[TensorSpec]] = None):
     self._latest_snapshot: tuple[tree_types.PyTree, int] | None = None
@@ -68,23 +93,7 @@ class Snapshotter:
         if old_snapshot is not None and isinstance(active_mesh, jax.sharding.Mesh):
           old_state, old_step = old_snapshot
           _logger.info("[ELASTIC] Selectively deleting old snapshot (step %d) shards on active mesh...", old_step)
-          deleted_shards_count = 0
-          ignored_shards_count = 0
-          
-          def selective_delete(x):
-              nonlocal deleted_shards_count, ignored_shards_count
-              if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
-                  for shard in x.addressable_shards:
-                      try:
-                          if shard.device in active_mesh.devices:
-                              shard.data.delete()
-                              deleted_shards_count += 1
-                          else:
-                              ignored_shards_count += 1
-                      except Exception:
-                          pass
-          
-          jax.tree.map(selective_delete, old_state)
+          deleted_shards_count, ignored_shards_count = self._selective_delete_pytree(old_state, active_mesh.devices)
           _logger.info("[ELASTIC] Selective snapshot deletion complete. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
           del old_state, old_snapshot
           import gc
@@ -145,22 +154,7 @@ class Snapshotter:
             if task is not None:
                 pinned_state = task[0]
                 
-                deleted_shards_count = 0
-                ignored_shards_count = 0
-                def selective_delete(x):
-                    nonlocal deleted_shards_count, ignored_shards_count
-                    if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
-                        for shard in x.addressable_shards:
-                            try:
-                                if shard.device in active_devices:
-                                    shard.data.delete()
-                                    deleted_shards_count += 1
-                                else:
-                                    ignored_shards_count += 1
-                            except Exception:
-                                pass
-                            
-                jax.tree.map(selective_delete, pinned_state)
+                deleted_shards_count, ignored_shards_count = self._selective_delete_pytree(pinned_state, active_devices)
                 _logger.info("[ELASTIC] Cancelled pending snapshot. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
             self._queue.task_done()
         except queue.Empty:
@@ -347,21 +341,7 @@ class Snapshotter:
     
     if reset_snapshot_state:
         _logger.info("[ELASTIC] Resetting snapshot state. Selectively deleting old snapshot shards on active mesh...")
-        deleted_shards_count = 0
-        ignored_shards_count = 0
-        def selective_delete(x):
-            nonlocal deleted_shards_count, ignored_shards_count
-            if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
-                for shard in x.addressable_shards:
-                    try:
-                        if shard.device in mesh.devices:
-                            shard.data.delete()
-                            deleted_shards_count += 1
-                        else:
-                            ignored_shards_count += 1
-                    except Exception:
-                        pass
-        jax.tree.map(selective_delete, pinned_state)
+        deleted_shards_count, ignored_shards_count = self._selective_delete_pytree(pinned_state, mesh.devices)
         _logger.info("[ELASTIC] Selective snapshot deletion complete. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
         
         with self._lock:
