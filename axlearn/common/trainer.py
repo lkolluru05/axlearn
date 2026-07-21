@@ -152,6 +152,7 @@ def sync_restore_class_vars(
                 state_restored = True
             except Exception as e:
                 logging.exception("[ELASTIC] Failed to load from snapshot:")
+                logging.error("[DIAGNOSTIC] Root exception during load_pytree: %s", repr(e), exc_info=True)
 
     use_jax_state = jax_device_state_arg
     if not state_restored and use_jax_state and "_trainer_state" in use_jax_state:

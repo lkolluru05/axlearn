@@ -128,12 +128,6 @@ FLAGS = flags.FLAGS
 elastic_snapshotting_enabled = True
 
 
-def is_pathways_proxy() -> bool:
-    """Returns True if 'proxy' is in JAX_PLATFORMS environment variable."""
-    platforms = [p.strip().lower() for p in os.getenv("JAX_PLATFORMS", "").split(",") if p.strip()]
-    return "proxy" in platforms
-
-
 def get_trainer_config(
     trainer_config_fn: Optional[TrainerConfigFn] = None,
     *,
@@ -165,10 +159,9 @@ def get_trainer_config(
     if flag_values.mesh_selector is not None:
         select_mesh_config(trainer_config, mesh_selector=flag_values.mesh_selector)
     trainer_config.mesh_axis_names = trainer_config.mesh_axis_names or ("data", "model")
-    if not is_pathways_proxy():
-        trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
-        if isinstance(trainer_config.mesh_shape, MeshShape):
-            trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
+    trainer_config.mesh_shape = trainer_config.mesh_shape or (len(jax.devices()), 1)
+    if isinstance(trainer_config.mesh_shape, MeshShape):
+        trainer_config.mesh_shape = infer_mesh_shape(trainer_config.mesh_shape)
     trainer_config.start_trace_steps = [int(el) for el in flag_values.trace_at_steps]
     if flag_values["n_steps_for_each_trace"].present:
         trainer_config.n_steps_for_each_trace = int(flag_values.n_steps_for_each_trace)
@@ -256,6 +249,90 @@ def _cleanup_live_arrays(preserved_snapshot: Any):
     logging.info("[ELASTIC] Deleted %d temporary/remote arrays.", deleted_count)
 
 
+def _teardown_and_preserve_state(
+    trainer: Any,
+    python_vars: dict,
+    jax_device_state: dict,
+    immutable_data: dict,
+) -> tuple[dict, dict, dict]:
+    """Safely terminates snapshot manager, extracts state, and prunes JAX array references."""
+    if trainer is not None:
+        extracted_device_state = getattr(trainer, "_jax_device_state", {})
+        extracted_python_vars = getattr(trainer, "_python_vars", {})
+        extracted_immutable_data = getattr(trainer, "_immutable_data", {})
+
+        jax_device_state.update(extracted_device_state)
+        python_vars.update(extracted_python_vars)
+        immutable_data.update(extracted_immutable_data)
+
+        if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
+            if hasattr(trainer.snapshot_mgr, "join"):
+                trainer.snapshot_mgr.join()
+            if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
+                python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
+                logging.info("[ELASTIC] Preserved raw _latest_snapshot in python_vars for recovery.")
+            if hasattr(trainer.snapshot_mgr, "close"):
+                trainer.snapshot_mgr.close()
+
+        logging.info("[ELASTIC] Stripping physical mesh and compiled XLA executables from state to release HBM.")
+        jax_device_state.pop("_mesh", None)
+        jax_device_state.pop("_compiled_train_step", None)
+        jax_device_state.pop("_jit_train_step", None)
+        jax_device_state.pop("model", None)
+        jax_device_state.pop("learner", None)
+        old_state = jax_device_state.pop("_trainer_state", None)
+        if old_state is not None:
+            jax.tree.map(lambda x: x.delete() if isinstance(x, jax.Array) and hasattr(x, "delete") else None, old_state)
+
+        logging.info("[ELASTIC] Severing references on trainer object to break cycles...")
+        trainer._compiled_train_step = None
+        trainer._jit_train_step = None
+        trainer._mesh = None
+
+    clean_python_vars = {}
+    for k in ["_latest_snapshot", "_step"]:
+        if k in python_vars:
+            clean_python_vars[k] = python_vars[k]
+
+    logging.info("[ELASTIC] Clearing JAX caches and live arrays before recovery/transition...")
+    jax.clear_caches()
+    _cleanup_live_arrays(clean_python_vars.get("_latest_snapshot"))
+    gc.collect()
+    return clean_python_vars, jax_device_state, immutable_data
+
+
+@contextlib.contextmanager
+def _slice_monitor_context(elastic_manager: Any, original_slices: int):
+    """Context manager to start and stop the background slice monitor thread in degraded mode."""
+    monitor_thread = None
+    stop_monitor_event = threading.Event()
+    if elastic_manager and hasattr(elastic_manager, "slice_to_devices"):
+        try:
+            active_slices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
+            if len(active_slices) < original_slices:
+                logging.info(
+                    "[ELASTIC] Degraded mode detected (active slices: %s, target: %d). Starting slice monitor thread...",
+                    active_slices, original_slices
+                )
+                def monitor_loop():
+                    try:
+                        elastic_manager._monitor_new_slices(stop_monitor_event, poll_interval=10)
+                    except Exception as thread_err:
+                        logging.warning("[ELASTIC] Error in monitor thread: %s", thread_err)
+                monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+                monitor_thread.start()
+        except Exception as mon_err:
+            logging.warning("[ELASTIC] Failed to start monitor thread: %s", mon_err)
+    try:
+        yield
+    finally:
+        if monitor_thread is not None:
+            logging.info("[ELASTIC] Stopping slice monitor thread...")
+            stop_monitor_event.set()
+            monitor_thread.join(timeout=5)
+            logging.info("[ELASTIC] Slice monitor thread stopped.")
+
+
 def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     measurement.record_event(measurement.Event.START_JOB)
     trainer_config_debug_string = trainer_config.debug_string()
@@ -332,87 +409,24 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 trainer = clean_trainer
                 prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
 
-            if isinstance(jax_device_state, dict):
-                jax_device_state.clear()
-            try:
-                del jax_device_state, immutable_data, clean_trainer
-            except NameError:
-                pass
+            jax_device_state = {}
+            immutable_data = {}
+            clean_trainer = None
             gc.collect()
 
-            monitor_thread = None
-            stop_monitor_event = threading.Event()
-            if elastic_manager and hasattr(elastic_manager, "slice_to_devices"):
-                try:
-                    active_slices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
-                    if len(active_slices) < original_slices:
-                        logging.info(
-                            "[ELASTIC] Degraded mode detected (active slices: %s, target: %d). Starting slice monitor thread...",
-                            active_slices, original_slices
-                        )
-                        def monitor_loop():
-                            try:
-                                elastic_manager._monitor_new_slices(stop_monitor_event, poll_interval=10)
-                            except Exception as thread_err:
-                                logging.warning("[ELASTIC] Error in monitor thread: %s", thread_err)
-                        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-                        monitor_thread.start()
-                except Exception as mon_err:
-                    logging.warning("[ELASTIC] Failed to start monitor thread: %s", mon_err)
-
-            try:
+            with _slice_monitor_context(elastic_manager, original_slices):
                 logging.info("[ELASTIC] Starting trainer.run().")
                 output = trainer.run(prng_key)
                 logging.info("[ELASTIC] trainer.run() completed.")
-            finally:
-                if monitor_thread is not None:
-                    logging.info("[ELASTIC] Stopping slice monitor thread...")
-                    stop_monitor_event.set()
-                    monitor_thread.join(timeout=5)
-                    logging.info("[ELASTIC] Slice monitor thread stopped.")
 
             from axlearn.common.utils import ScaleUpSignal
             if isinstance(output, ScaleUpSignal):
                 logging.info("[ELASTIC] Scale-up signal received! Initiating transition to expanded mesh...")
-                if trainer is not None:
-                    jax_device_state = getattr(trainer, "_jax_device_state", {})
-                    python_vars = getattr(trainer, "_python_vars", {})
-                    if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
-                        if hasattr(trainer.snapshot_mgr, "cancel_pending"):
-                            logging.info("[ELASTIC] Invoking snapshot_mgr.cancel_pending() to abort in-flight transfers...")
-                            trainer.snapshot_mgr.cancel_pending()
-                        if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
-                            python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
-                            logging.info("[ELASTIC] Preserving raw _latest_snapshot in python_vars for scale-up recovery.")
-                        if hasattr(trainer.snapshot_mgr, "close"):
-                            trainer.snapshot_mgr.close()
-                    immutable_data = getattr(trainer, "_immutable_data", {})
-
-                    jax_device_state.pop("_mesh", None)
-                    jax_device_state.pop("_compiled_train_step", None)
-                    jax_device_state.pop("_jit_train_step", None)
-                    jax_device_state.pop("model", None)
-                    jax_device_state.pop("learner", None)
-                    old_state = jax_device_state.pop("_trainer_state", None)
-                    if old_state is not None:
-                        jax.tree.map(lambda x: x.delete() if isinstance(x, jax.Array) and hasattr(x, "delete") else None, old_state)
-
-                    trainer._compiled_train_step = None
-                    trainer._jit_train_step = None
-                    trainer._mesh = None
-
-                clean_python_vars = {}
-                for k in ["_latest_snapshot", "_step"]:
-                    if k in python_vars:
-                        clean_python_vars[k] = python_vars[k]
-                python_vars = clean_python_vars
-
-                logging.info("[ELASTIC] Clearing JAX caches and live arrays before scale-up transition...")
-                jax.clear_caches()
-                _cleanup_live_arrays(python_vars.get("_latest_snapshot"))
+                python_vars, jax_device_state, immutable_data = _teardown_and_preserve_state(
+                    trainer, python_vars, jax_device_state, immutable_data
+                )
                 trainer = None
                 clean_trainer = None
-                gc.collect()
 
                 elastic_manager_initialized = False
 
@@ -444,125 +458,13 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                 logging.warning(
                     "[ELASTIC] Caught retryable error: %s. Initiating in-memory state preservation and TPU cleanup...", e
                 )
-                if trainer is not None:
-                    jax_device_state = getattr(trainer, "_jax_device_state", {})
-                    python_vars = getattr(trainer, "_python_vars", {})
-                    if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
-                        if hasattr(trainer.snapshot_mgr, "cancel_pending"):
-                            logging.info("[ELASTIC] Invoking snapshot_mgr.cancel_pending() to abort in-flight transfers...")
-                            trainer.snapshot_mgr.cancel_pending()
-                        if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
-                            python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
-                            logging.info("[ELASTIC] Preserving raw _latest_snapshot in python_vars for subsequent recovery.")
-                        if hasattr(trainer.snapshot_mgr, "close"):
-                            trainer.snapshot_mgr.close()
-                    immutable_data = getattr(trainer, "_immutable_data", {})
-
-                    logging.info("[ELASTIC] Stripping physical mesh and compiled XLA executables from state to release HBM.")
-                    jax_device_state.pop("_mesh", None)
-                    # Free massive XLA executables and module caches from device memory before mesh re-creation
-                    jax_device_state.pop("_compiled_train_step", None)
-                    jax_device_state.pop("_jit_train_step", None)
-                    jax_device_state.pop("model", None)
-                    jax_device_state.pop("learner", None)
-                    # MaxText pattern: Physical device HBM arrays (_trainer_state) are invalidated across preemption and mesh re-creation.
-                    # Pop _trainer_state from _jax_device_state so recovery relies solely on host-pinned snapshot_mgr memory.
-                    old_state = jax_device_state.pop("_trainer_state", None)
-                    if old_state is not None:
-                        jax.tree.map(lambda x: x.delete() if isinstance(x, jax.Array) and hasattr(x, "delete") else None, old_state)
-
-                    logging.info("[ELASTIC] Severing references on trainer object to break cycles...")
-                    trainer._compiled_train_step = None
-                    trainer._jit_train_step = None
-                    trainer._mesh = None
-
-                # Prune python_vars to break the _children -> _parent back-reference cycle.
-                clean_python_vars = {}
-                for k in ["_latest_snapshot", "_step"]:
-                    if k in python_vars:
-                        clean_python_vars[k] = python_vars[k]
-                python_vars = clean_python_vars
-                
-                logging.info("[ELASTIC] Clearing JAX caches and live arrays before recovery attempt...")
-                jax.clear_caches()
-                _cleanup_live_arrays(python_vars.get("_latest_snapshot"))
-
-                # Clear old trainer objects and JAX caches to release TPU HBM and device handles.
-                # We keep the extracted state dictionaries above to restore onto the new mesh.
-                logging.info("[ELASTIC] Clearing old trainer references and running garbage collection...")
+                python_vars, jax_device_state, immutable_data = _teardown_and_preserve_state(
+                    trainer, python_vars, jax_device_state, immutable_data
+                )
                 trainer = None
                 clean_trainer = None
-                gc.collect()
 
-                def crawl_for_jax_arrays(obj, path, visited=None):
-                    logging.info("[ELASTIC_DEBUG] Crawling %s", path)
-                    if visited is None:
-                        visited = set()
-                    try:
-                        obj_id = id(obj)
-                    except Exception:
-                        return
-                    if obj_id in visited:
-                        return
-                    visited.add(obj_id)
-                    
-                    if isinstance(obj, jax.Array):
-                        try:
-                            s = getattr(obj, "sharding", None)
-                            if s is None and hasattr(obj, "devices"):
-                                s = obj.devices()
-                        except Exception as inner_e:
-                            s = f"error: {inner_e}"
-                        try:
-                            shape = getattr(obj, "shape", None)
-                        except Exception:
-                            shape = "error"
-                        logging.info("[ELASTIC_DEBUG] Found jax.Array at %s: shape=%s, sharding/devices=%s", path, shape, s)
-                        return
-                    
-                    if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            crawl_for_jax_arrays(v, f"{path}[{repr(k)}]", visited)
-                    elif isinstance(obj, (list, tuple, set, frozenset)):
-                        for i, v in enumerate(obj):
-                            crawl_for_jax_arrays(v, f"{path}[{i}]", visited)
-                    else:
-                        if hasattr(obj, "__dict__"):
-                            try:
-                                for k, v in vars(obj).items():
-                                    crawl_for_jax_arrays(v, f"{path}.{k}", visited)
-                            except Exception:
-                                pass
-                        
-                        if hasattr(type(obj), "__slots__"):
-                            try:
-                                slots = type(obj).__slots__
-                                if isinstance(slots, str):
-                                    slots = [slots]
-                                for k in slots:
-                                    if hasattr(obj, k):
-                                        crawl_for_jax_arrays(getattr(obj, k), f"{path}.{k}", visited)
-                            except Exception:
-                                pass
-
-                logging.info("[ELASTIC_DEBUG] Crawling python_vars for jax.Array...")
-                crawl_for_jax_arrays(python_vars, "python_vars")
-                logging.info("[ELASTIC_DEBUG] Crawling jax_device_state for jax.Array...")
-                crawl_for_jax_arrays(jax_device_state, "jax_device_state")
-                logging.info("[ELASTIC_DEBUG] Crawling immutable_data for jax.Array...")
-                crawl_for_jax_arrays(immutable_data, "immutable_data")
-
-                current_step = -1
-                if trainer is not None:
-                    try:
-                        current_step = int(trainer.step)
-                    except Exception:
-                        pass
-                if current_step == -1:
-                    current_step = int(python_vars.get("_step", -1))
-                if current_step == -1:
-                    current_step = int(immutable_data.get("_step", -1))
-
+                current_step = int(python_vars.get("_step", -1))
                 if current_step > last_successful_step:
                     last_successful_step = current_step
                     consecutive_failures = 1

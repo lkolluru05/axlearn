@@ -136,20 +136,35 @@ class Snapshotter:
       self._last_worker_error = None
       self._generation += 1
 
-    cancelled_count = 0
+    mesh = get_current_abstract_or_physical_mesh()
+    active_devices = mesh.devices if isinstance(mesh, jax.sharding.Mesh) else set()
+
     while not self._queue.empty():
         try:
             task = self._queue.get_nowait()
             if task is not None:
-                del task
-                cancelled_count += 1
+                pinned_state = task[0]
+                
+                deleted_shards_count = 0
+                ignored_shards_count = 0
+                def selective_delete(x):
+                    nonlocal deleted_shards_count, ignored_shards_count
+                    if isinstance(x, jax.Array) and hasattr(x, "addressable_shards"):
+                        for shard in x.addressable_shards:
+                            try:
+                                if shard.device in active_devices:
+                                    shard.data.delete()
+                                    deleted_shards_count += 1
+                                else:
+                                    ignored_shards_count += 1
+                            except Exception:
+                                pass
+                            
+                jax.tree.map(selective_delete, pinned_state)
+                _logger.info("[ELASTIC] Cancelled pending snapshot. Deleted %d shards, ignored %d shards on inactive devices.", deleted_shards_count, ignored_shards_count)
             self._queue.task_done()
         except queue.Empty:
             break
-            
-    import gc
-    gc.collect()
-    _logger.info("[ELASTIC] Cancelled %d pending snapshot tasks and cleared CPU host RAM.", cancelled_count)
             
     self._queue.put(None)
     self._worker_thread.join()
@@ -233,8 +248,6 @@ class Snapshotter:
       if len(x.addressable_shards) == 1 and x.addressable_shards[0].data.shape == x.shape:
           return x.addressable_shards[0].data
 
-      active_device_ids = {d.id for d in mesh.devices} if isinstance(mesh, jax.sharding.Mesh) else {d.id for d in jax.devices()}
-
       # Try to reconstruct using make_array_from_single_device_arrays to avoid client OOM
       try:
           target_sharding = getattr(spec, "sharding", None)
@@ -247,25 +260,24 @@ class Snapshotter:
 
               healthy_device_to_array = {}
               for shard in x.addressable_shards:
-                  if shard.device.id in active_device_ids:
-                      try:
-                          # Verify buffer is alive on active device
-                          jax.block_until_ready(shard.data)
-                          healthy_device_to_array[shard.device.id] = shard.data
-                      except (jax.errors.JaxRuntimeError, Exception):
-                          pass  # Skip unresponsive shards
+                  try:
+                      # Verify buffer is alive
+                      jax.block_until_ready(shard.data)
+                      healthy_device_to_array[shard.device] = shard.data
+                  except jax.errors.JaxRuntimeError:
+                      pass  # Skip unresponsive shards
 
               # Build the list of arrays matching target_sharding addressable_devices
               arrays = []
               success = True
-              healthy_device_ids_list = list(healthy_device_to_array.keys())
+              healthy_devices_list = list(healthy_device_to_array.keys())
               for i, device in enumerate(target_sharding.addressable_devices):
-                  if device.id in healthy_device_to_array:
-                      arrays.append(healthy_device_to_array[device.id])
-                  elif healthy_device_ids_list:
+                  if device in healthy_device_to_array:
+                      arrays.append(healthy_device_to_array[device])
+                  elif healthy_devices_list:
                       # Scale-up handling: Rebind healthy slice 0 shard to target device handle
-                      fallback_id = healthy_device_ids_list[i % len(healthy_device_ids_list)]
-                      src_shard = healthy_device_to_array[fallback_id]
+                      fallback_device = healthy_devices_list[i % len(healthy_devices_list)]
+                      src_shard = healthy_device_to_array[fallback_device]
                       try:
                           single_sharding = jax.sharding.SingleDeviceSharding(device).with_memory_kind("pinned_host")
                           rebound_shard = jax.device_put(src_shard, single_sharding)
@@ -278,8 +290,7 @@ class Snapshotter:
                       break
               
               if success:
-                  target_shape = tuple(spec.shape) if hasattr(spec.shape, "__iter__") else spec.shape
-                  res = jax.make_array_from_single_device_arrays(target_shape, target_sharding, arrays)
+                  res = jax.make_array_from_single_device_arrays(spec.shape, target_sharding, arrays)
                   _logger.info("[ELASTIC] Successfully reconstructed array using make_array_from_single_device_arrays (with replica fallback)")
                   return res
       except Exception as make_arr_err:
@@ -292,16 +303,15 @@ class Snapshotter:
           has_valid_data = False
 
           for shard in x.addressable_shards:
-              if shard.device.id in active_device_ids:
-                  try:
-                      # Verify buffer is alive and addressable on local target chip/host
-                      jax.block_until_ready(shard.data)
-                      idx = getattr(shard, "index", None)
-                      if idx is not None:
-                          host_buf[idx] = np.asarray(shard.data)
-                          has_valid_data = True
-                  except (jax.errors.JaxRuntimeError, Exception):
-                      pass  # Skip unresponsive shards from dead slices
+              try:
+                  # Verify buffer is alive and addressable on local target chip/host
+                  jax.block_until_ready(shard.data)
+                  idx = getattr(shard, "index", None)
+                  if idx is not None:
+                      host_buf[idx] = np.asarray(shard.data)
+                      has_valid_data = True
+              except jax.errors.JaxRuntimeError:
+                  pass  # Skip unresponsive shards from dead slices
 
           if has_valid_data:
               return host_buf

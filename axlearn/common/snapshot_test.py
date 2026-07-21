@@ -223,6 +223,28 @@ class SnapshotterTest(parameterized.TestCase):
         restored = snapshotter.load_pytree()
         self.assertTrue(jnp.array_equal(restored["prng_key"], state["prng_key"]))
 
+  def test_single_device_sharded_leaf_recovery(self):
+    devices = jax.devices()
+    self.assertLen(devices, 2)
+    mesh = jax.sharding.Mesh(devices, ("data",))
+    # SingleDeviceSharding does not have a .mesh attribute
+    single_sharding = jax.sharding.SingleDeviceSharding(devices[1], memory_kind="pinned_host")
+    state_specs = {
+        "scalar_param": TensorSpec(shape=(4,), dtype=jnp.float32, mesh_axes=())
+    }
+    snapshotter = Snapshotter(replica_axis_index=0, trainer_state_specs=state_specs)
+    with mesh:
+      val = jax.device_put(jnp.array([1.0, 2.0, 3.0, 4.0], dtype=jnp.float32), single_sharding)
+      state = {"scalar_param": val}
+      snapshotter._latest_snapshot = (state, 1)
+
+      # Test load_pytree when devices[1] is dead and mesh contains devices[0]
+      mesh0 = jax.sharding.Mesh([devices[0]], ("data",))
+      with mesh0:
+        restored = snapshotter.load_pytree()
+        self.assertIsNotNone(restored)
+        self.assertTrue(jnp.array_equal(np.asarray(restored["scalar_param"]), np.array([1.0, 2.0, 3.0, 4.0])))
+
   def test_worker_error_generation_and_recovery(self):
     devices = jax.devices()
     mesh = jax.sharding.Mesh(devices, ("data",))
