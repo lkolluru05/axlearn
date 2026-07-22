@@ -989,11 +989,23 @@ py_library(
 )
 
 py_library(
+    name = "elastic_utils",
+    srcs = ["elastic_utils.py"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@axlearn_pip//absl_py",
+        "@axlearn_pip//jax",
+        "@axlearn_pip//numpy",
+    ],
+)
+
+py_library(
     name = "utils",
     srcs = ["utils.py"],
     visibility = ["//visibility:public"],
     deps = [
         ":config",
+        ":elastic_utils",
         ":serialization",
         "@axlearn_pip//absl_py",
         "@axlearn_pip//attrs",
@@ -3325,6 +3337,16 @@ py_test(
     ],
     deps = [
         ":t5_test_lib",
+        "@axlearn_pip//absl_py",
+    ],
+)
+
+py_test(
+    name = "elastic_utils_test",
+    srcs = ["elastic_utils_test.py"],
+    deps = [
+        ":elastic_utils",
+        ":utils",
         "@axlearn_pip//absl_py",
     ],
 )

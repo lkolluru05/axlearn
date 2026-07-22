@@ -2173,124 +2173,15 @@ def get_tpu_dot_precision(dtype) -> jax.lax.Precision:
     raise ValueError(f"Unsupported dtype {dtype}")
 
 
-try:
-    import pathwaysutils
-    from pathwaysutils.elastic import manager as pathways_manager
-    from pathwaysutils.elastic import manager
-except (ImportError, ModuleNotFoundError):
-    pathwaysutils = None
-    pathways_manager = None
-    manager = None
-
-elastic_manager: Optional[Any] = None
-
-
-def set_elastic_manager(manager_inst: Any):
-    """Sets the global elastic manager."""
-    global elastic_manager
-    elastic_manager = manager_inst
-
-
-def live_devices():
-    device_list = jax.devices()
-    if pathwaysutils is None or not hasattr(pathwaysutils, "is_pathways_backend_used") or not pathwaysutils.is_pathways_backend_used():
-        return device_list
-    
-    global elastic_manager
-    if elastic_manager is None:
-        logging.warning("[ELASTIC] elastic_manager is not initialized. Returning all devices.")
-        return device_list
-        
-    try:
-        from pathwaysutils.elastic import elastic
-        active_slice_indices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
-        elastic_manager.active_slice_indices = active_slice_indices
-    except Exception as e:
-        logging.warning("[ELASTIC] Failed to get active slice indices: %s. Falling back to cached values.", e)
-        active_slice_indices = getattr(elastic_manager, "active_slice_indices", set())
-        
-    active_devices = [
-        d for d in device_list if d is not None and getattr(d, "slice_index", 0) in active_slice_indices
-    ]
-    if active_devices:
-        return sorted(active_devices, key=lambda d: (getattr(d, "slice_index", 0), getattr(d, "coords", ())))
-    return device_list
-
-
-def wait_for_slices(slice_count: int, timeout_seconds: int = 300):
-    if pathwaysutils is None or not hasattr(pathwaysutils, "is_pathways_backend_used") or not pathwaysutils.is_pathways_backend_used():
-        return
-    
-    logging.info("[ELASTIC] Waiting for at least %d slices to be active (timeout: %ds)...", slice_count, timeout_seconds)
-    try:
-        from pathwaysutils.elastic import elastic
-        elastic.wait_for_slices(slice_count=slice_count, timeout=timeout_seconds)
-        logging.info("[ELASTIC] Sufficient slices are active.")
-    except Exception as e:
-        logging.error("[ELASTIC] Timed out or failed waiting for slices to be active: %s", e)
-        raise RuntimeError(f"Failed to wait for active slices: {e}") from e
-
-
-def wait_for_all_devices(timeout_seconds: int = 300):
-    if pathwaysutils is None or not hasattr(pathwaysutils, "is_pathways_backend_used") or not pathwaysutils.is_pathways_backend_used():
-        return
-    
-    device_list = jax.devices()
-    expected_slices = len(set(getattr(d, "slice_index", 0) for d in device_list if d is not None))
-    wait_for_slices(slice_count=expected_slices, timeout_seconds=timeout_seconds)
-
-
-
-def live_slice_indices() -> set[int]:
-    return {d.slice_index for d in live_devices()}
-
-
-class ScaleUpRequest(Exception):
-    """Raised when a scale-up event is detected and training needs to be interrupted."""
-    pass
-
-
-class ScaleUpSignal:
-    """Status object returned by SpmdTrainer.run() when a scale-up event occurs."""
-    def __init__(self, message: str = "Scale-up event detected."):
-        self.message = message
-
-
-class ElasticRecoveryTimer:
-    """Helper class to track and report detailed timing telemetry for elastic recovery."""
-
-    def __init__(self, recovery_type: str = "scale_down"):
-        self.recovery_type = recovery_type
-        self.start_time = time.perf_counter()
-        self.durations: dict[str, float] = {}
-
-    @contextlib.contextmanager
-    def time_subtask(self, name: str):
-        t0 = time.perf_counter()
-        try:
-            yield
-        finally:
-            self.durations[name] = time.perf_counter() - t0
-
-    def total_duration(self) -> float:
-        return time.perf_counter() - self.start_time
-
-    def log_summary(self):
-        total = self.total_duration()
-        logging.info(
-            "[ELASTIC] [TIMING] === Elastic Recovery Timing Summary (%s) ===", self.recovery_type
-        )
-        logging.info("[ELASTIC] [TIMING] Total Recovery Duration: %.3f seconds", total)
-        for name, duration in self.durations.items():
-            percentage = (duration / total * 100) if total > 0 else 0
-            logging.info(
-                "[ELASTIC] [TIMING]   - %-40s : %7.3f s (%5.1f%%)",
-                name, duration, percentage
-            )
-        logging.info("[ELASTIC] [TIMING] ==============================================")
-
-
-def get_elastic_manager() -> Optional[Any]:
-    """Returns the globally registered elastic manager instance."""
-    global elastic_manager
-    return elastic_manager
+from axlearn.common.elastic_utils import (
+    ElasticRecoveryTimer,
+    ScaleUpRequest,
+    ScaleUpSignal,
+    create_elastic_manager,
+    get_elastic_manager,
+    live_devices,
+    live_slice_indices,
+    set_elastic_manager,
+    wait_for_all_devices,
+    wait_for_slices,
+)

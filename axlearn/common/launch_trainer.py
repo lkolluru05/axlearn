@@ -17,8 +17,17 @@ from axlearn.common import file_system as fs
 from axlearn.common import measurement
 from axlearn.common.config import TrainerConfigFn, get_named_trainer_config
 from axlearn.common.trainer import SpmdTrainer, select_mesh_config, sync_restore_class_vars, sync_store_class_vars
+from axlearn.common import elastic_utils
 from axlearn.common import utils
-from axlearn.common.utils import ElasticRecoveryTimer, MeshShape, get_data_dir, infer_mesh_shape, live_devices, set_elastic_manager, wait_for_all_devices, wait_for_slices
+from axlearn.common.elastic_utils import (
+    ElasticRecoveryTimer,
+    create_elastic_manager,
+    live_devices,
+    set_elastic_manager,
+    wait_for_all_devices,
+    wait_for_slices,
+)
+from axlearn.common.utils import MeshShape, get_data_dir, infer_mesh_shape
 import numpy as np
 from pathwaysutils.elastic import manager, elastic
 from pathwaysutils.debug import watchdog
@@ -201,13 +210,7 @@ def get_trainer_config(
 
 
 def is_retryable_error(e: Exception) -> bool:
-    if isinstance(e, jax.errors.JaxRuntimeError):
-        err_str = str(e)
-        if elastic.is_error_due_to_slice_down(e):
-            return True
-        if "UNAVAILABLE" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-            return True
-    return False
+    return elastic_utils.is_retryable_error(e)
 
 
 def _cleanup_live_arrays(preserved_snapshot: Any):
@@ -382,7 +385,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             recovery_timer = None
             if (elastic_manager and elastic_manager.new_slice_event.is_set()) or python_vars.get("_latest_snapshot") is not None or immutable_data or jax_device_state:
                 rec_type = "scale_up" if (elastic_manager and elastic_manager.new_slice_event.is_set()) else "scale_down"
-                recovery_timer = utils.ElasticRecoveryTimer(recovery_type=rec_type)
+                recovery_timer = ElasticRecoveryTimer(recovery_type=rec_type)
 
             with (recovery_timer.time_subtask("2_clean_trainer_instantiation") if recovery_timer else contextlib.nullcontext()):
                 clean_trainer: SpmdTrainer = trainer_config.instantiate(parent=None)

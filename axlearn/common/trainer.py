@@ -26,6 +26,11 @@ from pathwaysutils.debug import watchdog
 
 from axlearn.common import file_system as fs
 from axlearn.common import measurement, utils
+from axlearn.common.elastic_utils import (
+    _inject_fresh_prng_key,
+    sync_restore_class_vars,
+    sync_store_class_vars,
+)
 from axlearn.common.base_layer import ParameterSpec
 from axlearn.common.base_model import BaseModel
 from axlearn.common.checkpointer import BaseCheckpointer, Checkpointer
@@ -78,205 +83,11 @@ from axlearn.common.utils import (
     live_devices,
 )
 
-JAX_STATE_KEYS = frozenset({
-    "_trainer_state", "_mesh", "_jit_train_step", "_compiled_train_step", "model", "learner"
-})
-EXCLUDED_KEYS = frozenset({
-    "_jax_device_state", "_python_vars", "_immutable_data"
-})
-RETRYABLE_KEYWORDS = ("data_loss", "unavailable", "unplaced", "slice down", "died")
-
-
-def _inject_fresh_prng_key(
-    trainer_state: Any,
-    mesh: Any,
-    step: Optional[int],
-) -> tuple[Any, Any]:
-    """Re-binds and injects a fresh PRNG key on the active mesh into trainer_state."""
-    seed = int(step) if step is not None else 42
-    if isinstance(mesh, jax.sharding.Mesh):
-        fresh_prng_key = jax.device_put(
-            jax.random.PRNGKey(seed=seed),
-            jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-        )
-    else:
-        fresh_prng_key = jax.random.PRNGKey(seed=seed)
-
-    try:
-        if hasattr(trainer_state, "_replace"):
-            trainer_state = trainer_state._replace(prng_key=fresh_prng_key)
-        elif isinstance(trainer_state, dict):
-            trainer_state["prng_key"] = fresh_prng_key
-        elif trainer_state is not None:
-            setattr(trainer_state, "prng_key", fresh_prng_key)
-        logging.info("[ELASTIC] [✓] Successfully injected fresh, healthy PRNG Key into the new trainer state.")
-    except Exception as e:
-        logging.warning("[ELASTIC] [!] Failed to replace prng_key inside trainer_state structure: %s", e)
-
-    return trainer_state, fresh_prng_key
-
-
-def sync_restore_class_vars(
-    fresh_trainer: Any,
-    jax_device_state_arg: dict,
-    python_vars_arg: dict,
-    immutable_data_arg: dict,
-) -> tuple[Any, Any]:
-    """Restores trainer state onto a fresh SpmdTrainer instance from snapshot."""
-    logging.info("[ELASTIC] Restoring class variables from snapshot.")
-    logging.info("[ELASTIC] Immutable data args: %s", immutable_data_arg)
-
-    use_python_vars = python_vars_arg
-    use_immutable_data = immutable_data_arg
-    use_jax_state = jax_device_state_arg
-
-    for k, v in use_immutable_data.items():
-        if isinstance(v, (int, float, str, bool)):
-            setattr(fresh_trainer, k, v)
-            
-    if "_step" in use_python_vars and getattr(fresh_trainer, "_step", None) is None:
-        try:
-            fresh_trainer._step = int(use_python_vars["_step"])
-        except Exception:
-            pass
-
-    mesh = fresh_trainer._mesh
-
-    if use_jax_state and "_trainer_state" in use_jax_state:
-        try:
-            old_state = use_jax_state.pop("_trainer_state")
-            jax.tree_util.tree_map(
-                lambda x: x.delete() if isinstance(x, jax.Array) else None,
-                old_state
-            )
-            logging.info("[ELASTIC] Successfully deleted pre-existing physical arrays from old state.")
-        except Exception as e:
-            logging.warning("[ELASTIC] Failed to delete pre-existing physical arrays: %s", e)
-
-    state_restored = False
-    latest_snapshot = use_python_vars.get("_latest_snapshot")
-    if latest_snapshot is not None:
-        logging.info("[ELASTIC] Found raw host-pinned _latest_snapshot. Instantiating fresh Snapshotter.")
-        replica_axis_idx = fresh_trainer.config.mesh_axis_names.index("data") if "data" in fresh_trainer.config.mesh_axis_names else 0
-        snapshot_cfg = config_for_class(Snapshotter).set(
-            replica_axis_index=replica_axis_idx,
-            trainer_state_specs=fresh_trainer._trainer_state_specs
-        )
-        snapshot_mgr = snapshot_cfg.instantiate()
-        snapshot_mgr._latest_snapshot = latest_snapshot
-    else:
-        snapshot_mgr = use_python_vars.get("snapshot_mgr")
-
-    if snapshot_mgr is not None:
-        with mesh:
-            try:
-                restored_trainer_state = snapshot_mgr.load_pytree(
-                    abstract_state=fresh_trainer._trainer_state_specs,
-                    reset_snapshot_state=False
-                )
-                snapshot_mgr.trainer_state_specs = fresh_trainer._trainer_state_specs
-                fresh_trainer._trainer_state = restored_trainer_state
-                t0_barrier = time.perf_counter()
-                jax.block_until_ready(fresh_trainer._trainer_state)
-                barrier_time = time.perf_counter() - t0_barrier
-                logging.info("[ELASTIC] [TIMING] Hardware Placement Barrier took %.3f seconds", barrier_time)
-                if getattr(snapshot_mgr, "latest", None) is not None:
-                    try:
-                        fresh_trainer._step = int(snapshot_mgr.latest.step)
-                    except Exception as e:
-                        logging.warning("Failed to extract step from snapshot_mgr.latest: %s", e)
-                logging.info("[ELASTIC] Successfully restored state from snapshot onto the new mesh.")
-                state_restored = True
-            except Exception as e:
-                logging.exception("[ELASTIC] Failed to load from snapshot:")
-                logging.error("[DIAGNOSTIC] Root exception during load_pytree: %s", repr(e), exc_info=True)
-
-    if not state_restored and use_jax_state and "_trainer_state" in use_jax_state:
-        logging.info("[ELASTIC] [!] Attempting fallback: device_put trainer_state from globals onto the new mesh.")
-        try:
-            with mesh:
-                fresh_trainer._trainer_state = jax.tree_util.tree_map(
-                    lambda state, spec: jax.device_put(state, spec.sharding),
-                    use_jax_state["_trainer_state"],
-                    fresh_trainer._trainer_state_specs
-                )
-                jax.block_until_ready(fresh_trainer._trainer_state)
-                logging.info("[ELASTIC] [✓] Successfully device_put trainer_state from globals onto the new mesh.")
-                state_restored = True
-        except Exception as e:
-            logging.warning("[ELASTIC] [!] Failed fallback to globals (possibly deleted arrays): %s", e)
-
-    if not state_restored:
-        raise RuntimeError(
-            "Elastic recovery triggered but failed to restore state from snapshot or globals. "
-            "Failing job to prevent silent model corruption."
-        )
-
-    fresh_trainer.snapshot_mgr = snapshot_mgr
-    fresh_trainer._is_restored = state_restored
-    fresh_trainer._compiled_train_step = None
-    fresh_trainer._watchdog_thread = None
-    fresh_trainer._watchdog_stopping = None
-    fresh_trainer._device_monitor = None
-    fresh_trainer._recorder = None
-
-    fresh_trainer._jax_device_state = use_jax_state
-    fresh_trainer._python_vars = use_python_vars
-    fresh_trainer._immutable_data = use_immutable_data
-
-    fresh_trainer._trainer_state, fresh_prng_key = _inject_fresh_prng_key(
-        fresh_trainer._trainer_state, mesh, fresh_trainer.step
-    )
-
-    return fresh_trainer, fresh_prng_key
-
-
-def sync_store_class_vars(obj: Any) -> tuple[dict, dict, dict]:
-    """Stores instance variables of an object in dictionaries."""
-    if getattr(obj, "_is_restored", False):
-        return (
-            getattr(obj, "_jax_device_state", {}),
-            getattr(obj, "_python_vars", {}),
-            getattr(obj, "_immutable_data", {}),
-        )
-    
-    logging.info("[ELASTIC] Storing class variables for snapshot.")
-    
-    jax_device_state = {}
-    python_vars = {}
-    immutable_data = {}
-
-    for k, v in obj.__dict__.items():
-        if isinstance(v, property) or k in EXCLUDED_KEYS:
-            continue
-
-        if k in JAX_STATE_KEYS:
-            jax_device_state[k] = v
-        elif "config" in k or "spec" in k or isinstance(v, (int, float, str, bool)):
-            immutable_data[k] = v
-        else:
-            python_vars[k] = v
-
-    logging.info("[ELASTIC] Preparing to save snapshot.")
-    snapshot_mgr = python_vars.get("snapshot_mgr")
-    if snapshot_mgr is not None:
-        try:
-            step_val = immutable_data.get("_step", python_vars.get("_step"))
-            snapshot_mgr.save_pytree(
-                step=int(step_val) if step_val is not None else 0,
-                state=jax_device_state["_trainer_state"],
-            )
-        except Exception as e:
-            err_str = str(e).lower()
-            if isinstance(e, jax.errors.JaxRuntimeError) or any(k in err_str for k in RETRYABLE_KEYWORDS):
-                logging.error("[CRITICAL ERROR] Preemption or hardware device error detected during snapshot save/join: %s", e)
-                raise e
-            logging.warning("[ELASTIC] Failed during snapshot save: %s", e)
-
-    logging.info("[ELASTIC] Storing class variables done.")
-    python_vars["snapshot_mgr"] = snapshot_mgr
-
-    return jax_device_state, python_vars, immutable_data
+from axlearn.common.elastic_utils import (
+    _inject_fresh_prng_key,
+    sync_restore_class_vars,
+    sync_store_class_vars,
+)
 
     
 

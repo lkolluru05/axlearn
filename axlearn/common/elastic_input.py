@@ -51,7 +51,8 @@ from axlearn.common import input_base
 from axlearn.common.config import REQUIRED, Required, config_class, maybe_set_config
 from axlearn.common.input_dispatch import BaseInputDispatcher, _validate_logical_feed_shapes
 from axlearn.common.module import Module
-from axlearn.common.utils import Nested, Tensor, live_devices
+from axlearn.common.elastic_utils import live_devices
+from axlearn.common.utils import Nested, Tensor
 
 
 class ElasticSpmdInputDispatcher(BaseInputDispatcher):

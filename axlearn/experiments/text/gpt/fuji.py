@@ -48,11 +48,11 @@ from axlearn.common.trainer_config_modifier import (
     PartitionSpecModifier,
     RematSpecModifier,
 )
+from axlearn.common.elastic_utils import live_devices
 from axlearn.common.utils import (
     HybridMeshShape,
     combine_remat_policies,
     extended_checkpoint_policies,
-    live_devices,
     save_and_offload_only_these_names_regex,
 )
 from axlearn.experiments.text.gpt.common import (
