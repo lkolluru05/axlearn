@@ -21,7 +21,11 @@ from axlearn.common import elastic_utils
 from axlearn.common import utils
 from axlearn.common.elastic_utils import (
     ElasticRecoveryTimer,
+    _cleanup_live_arrays,
+    _slice_monitor_context,
+    _teardown_and_preserve_state,
     create_elastic_manager,
+    is_retryable_error,
     live_devices,
     set_elastic_manager,
     wait_for_all_devices,
@@ -207,133 +211,6 @@ def get_trainer_config(
         if not isinstance(trainer_config.checkpointer.trainer_dir, str):
             trainer_config.checkpointer.trainer_dir = trainer_config.dir
     return trainer_config
-
-
-def is_retryable_error(e: Exception) -> bool:
-    return elastic_utils.is_retryable_error(e)
-
-
-def _cleanup_live_arrays(preserved_snapshot: Any):
-    active_array_ids = set()
-    if preserved_snapshot is not None:
-        try:
-            state = preserved_snapshot[0] if isinstance(preserved_snapshot, tuple) else preserved_snapshot
-            leaves = jax.tree_util.tree_leaves(state)
-            for leaf in leaves:
-                if isinstance(leaf, jax.Array):
-                    active_array_ids.add(id(leaf))
-        except Exception as e:
-            logging.warning("[ELASTIC] Failed to extract active array IDs from snapshot: %s", e)
-                
-    try:
-        client_cpu_devices = set(jax.local_devices(backend="cpu"))
-    except Exception:
-        client_cpu_devices = set()
-        
-    logging.info("[ELASTIC] Cleaning up live arrays, keeping snapshots and client-local CPU arrays...")
-    deleted_count = 0
-    for array in jax.live_arrays():
-        try:
-            if id(array) in active_array_ids:
-                continue
-            if hasattr(array.sharding, "memory_kind") and array.sharding.memory_kind == "pinned_host":
-                continue
-            try:
-                array_devs = set(array.devices())
-                if array_devs and array_devs.issubset(client_cpu_devices):
-                    continue
-            except Exception:
-                pass # Err on the side of deleting
-            
-            array.delete()
-            deleted_count += 1
-        except Exception as e:
-            logging.debug("[ELASTIC] Failed to delete array during cleanup: %s", e)
-    logging.info("[ELASTIC] Deleted %d temporary/remote arrays.", deleted_count)
-
-
-def _teardown_and_preserve_state(
-    trainer: Any,
-    python_vars: dict,
-    jax_device_state: dict,
-    immutable_data: dict,
-) -> tuple[dict, dict, dict]:
-    """Safely terminates snapshot manager, extracts state, and prunes JAX array references."""
-    if trainer is not None:
-        extracted_device_state = getattr(trainer, "_jax_device_state", {})
-        extracted_python_vars = getattr(trainer, "_python_vars", {})
-        extracted_immutable_data = getattr(trainer, "_immutable_data", {})
-
-        jax_device_state.update(extracted_device_state)
-        python_vars.update(extracted_python_vars)
-        immutable_data.update(extracted_immutable_data)
-
-        if hasattr(trainer, "snapshot_mgr") and trainer.snapshot_mgr is not None:
-            if hasattr(trainer.snapshot_mgr, "join"):
-                trainer.snapshot_mgr.join()
-            if hasattr(trainer.snapshot_mgr, "_latest_snapshot") and trainer.snapshot_mgr._latest_snapshot is not None:
-                python_vars["_latest_snapshot"] = trainer.snapshot_mgr._latest_snapshot
-                logging.info("[ELASTIC] Preserved raw _latest_snapshot in python_vars for recovery.")
-            if hasattr(trainer.snapshot_mgr, "close"):
-                trainer.snapshot_mgr.close()
-
-        logging.info("[ELASTIC] Stripping physical mesh and compiled XLA executables from state to release HBM.")
-        jax_device_state.pop("_mesh", None)
-        jax_device_state.pop("_compiled_train_step", None)
-        jax_device_state.pop("_jit_train_step", None)
-        jax_device_state.pop("model", None)
-        jax_device_state.pop("learner", None)
-        old_state = jax_device_state.pop("_trainer_state", None)
-        if old_state is not None:
-            jax.tree.map(lambda x: x.delete() if isinstance(x, jax.Array) and hasattr(x, "delete") else None, old_state)
-
-        logging.info("[ELASTIC] Severing references on trainer object to break cycles...")
-        trainer._compiled_train_step = None
-        trainer._jit_train_step = None
-        trainer._mesh = None
-
-    clean_python_vars = {}
-    for k in ["_latest_snapshot", "_step"]:
-        if k in python_vars:
-            clean_python_vars[k] = python_vars[k]
-
-    logging.info("[ELASTIC] Clearing JAX caches and live arrays before recovery/transition...")
-    jax.clear_caches()
-    _cleanup_live_arrays(clean_python_vars.get("_latest_snapshot"))
-    gc.collect()
-    return clean_python_vars, jax_device_state, immutable_data
-
-
-@contextlib.contextmanager
-def _slice_monitor_context(elastic_manager: Any, original_slices: int):
-    """Context manager to start and stop the background slice monitor thread in degraded mode."""
-    monitor_thread = None
-    stop_monitor_event = threading.Event()
-    if elastic_manager and hasattr(elastic_manager, "slice_to_devices"):
-        try:
-            active_slices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
-            if len(active_slices) < original_slices:
-                logging.info(
-                    "[ELASTIC] Degraded mode detected (active slices: %s, target: %d). Starting slice monitor thread...",
-                    active_slices, original_slices
-                )
-                def monitor_loop():
-                    try:
-                        elastic_manager._monitor_new_slices(stop_monitor_event, poll_interval=10)
-                    except Exception as thread_err:
-                        logging.warning("[ELASTIC] Error in monitor thread: %s", thread_err)
-                monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-                monitor_thread.start()
-        except Exception as mon_err:
-            logging.warning("[ELASTIC] Failed to start monitor thread: %s", mon_err)
-    try:
-        yield
-    finally:
-        if monitor_thread is not None:
-            logging.info("[ELASTIC] Stopping slice monitor thread...")
-            stop_monitor_event.set()
-            monitor_thread.join(timeout=5)
-            logging.info("[ELASTIC] Slice monitor thread stopped.")
 
 
 def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
