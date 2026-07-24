@@ -405,26 +405,11 @@ class SpmdTrainer(Module):
 
         if num_granules < original_granules:
             logging.info(
-                "[ELASTIC] Applying fractional scaling due to mesh degradation: %d -> %d slices.",
+                "[ELASTIC] Applying fractional scaling due to mesh degradation: %d -> %d slices. "
+                "Global logical batch size remains constant; scaling gradient accumulation steps instead.",
                 original_granules,
                 num_granules,
             )
-            
-            # 1. Simple input batch size
-            if hasattr(cfg.input, "batch_size") and getattr(cfg.input, "batch_size", None) is not None:
-                old_bs = cfg.input.batch_size
-                scaled_bs = (old_bs * num_granules) // original_granules
-                cfg.input.batch_size = max(1, scaled_bs)
-                logging.info("[ELASTIC] Scaled simple batch_size from %s to %s", old_bs, cfg.input.batch_size)
-            
-            # 2. Production input batch size
-            if hasattr(cfg.input, "input_dispatcher") and getattr(cfg.input, "input_dispatcher", None) is not None:
-                dispatcher = cfg.input.input_dispatcher
-                if hasattr(dispatcher, "global_logical_batch_size") and getattr(dispatcher, "global_logical_batch_size", None) is not None:
-                    old_bs = dispatcher.global_logical_batch_size
-                    scaled_bs = (old_bs * num_granules) // original_granules
-                    dispatcher.global_logical_batch_size = max(1, scaled_bs)
-                    logging.info("[ELASTIC] Scaled production global_logical_batch_size from %s to %s", old_bs, dispatcher.global_logical_batch_size)
             
             # 3. Simple gradient accumulation
             if hasattr(cfg.learner, "gradient_accumulation_steps") and getattr(cfg.learner, "gradient_accumulation_steps", None) is not None:
