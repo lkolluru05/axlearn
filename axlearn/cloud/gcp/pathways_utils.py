@@ -604,7 +604,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         # If multi-head, every pathways-head will only
         # be connected to one pathways instance (a pathways-worker replicated job).
         pathways_instance_count = cfg.accelerator.num_replicas if self._is_single_head else 1
-        num_elastic_slices = cfg.accelerator.num_replicas
+        num_elastic_slices = 1 #cfg.accelerator.num_replicas
 
         cmd_args = [
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
