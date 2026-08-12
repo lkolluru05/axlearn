@@ -770,16 +770,25 @@ def get_trainer_config_fn(
             )
             cfg.evalers[name] = evaler_cfg
         # Summaries and checkpoints.
+        from axlearn.common.checkpointer_orbax import OrbaxCheckpointer
+        
+        # We must register the Pathways handler HERE, after importing OrbaxCheckpointer,
+        # because checkpointer_orbax.py forcibly overrides the jax.Array handler internally.
+        from orbax.checkpoint import pathways
+        pathways.register_type_handlers(
+            checkpointing_impl=pathways.CheckpointingImpl.PERSISTENCE
+        )
+        
+        cfg.checkpointer = OrbaxCheckpointer.default_config()
         cfg.checkpointer.save_policy = config_for_function(every_n_steps_and_last_policy).set(
             n=save_every_n_steps or min(eval_every_n_steps, 5_000),
             max_step=max_step,
         )
-        cfg.checkpointer.keep_every_n_steps = min(max_step, keep_every_n_steps)
+        cfg.checkpointer.keep_period = min(max_step, keep_every_n_steps)
         cfg.checkpointer.keep_last_n = 3
         
         # Configure checkpointer limits to prevent coordinator host OOM during GCS saves
-        cfg.checkpointer.storage.max_concurrent_gb = 16
-        cfg.checkpointer.storage.max_data_shard_degree = 1
+        cfg.checkpointer.max_concurrent_save_gb = 16
         cfg.summary_writer.write_every_n_steps = min(eval_every_n_steps, 100)
         cfg.summary_writer.max_queue = 1000
         if len(mesh_axis_names) != len(mesh_shape):
