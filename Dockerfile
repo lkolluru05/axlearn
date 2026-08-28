@@ -2,7 +2,8 @@
 
 ARG TARGET=base
 ARG BASE_IMAGE=ubuntu:24.04
-ARG BASE_IMAGE_COLOCATED=us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/sidecar:2026_02_09-python_3.12-jax_0.8.3
+ARG BASE_IMAGE_COLOCATED=us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/sidecar:20260827_1842-python_3.12-jax_0.11.1
+#us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/sidecar:2026_02_09-python_3.12-jax_0.8.3
 
 FROM ${BASE_IMAGE} AS base
 
@@ -95,10 +96,10 @@ RUN \
     # 1. Install user-provided dependencies with modified constraints
     grep -v "^numpy" /opt/venv/server_constraints.txt | grep -v "^scipy" > /tmp/modified_constraints.txt && \
     echo "--> Installing user-provided dependencies..." && \
-    uv pip install ".[core,gcp]" -c /tmp/modified_constraints.txt && \
-    \
+    uv pip install ".[core,gcp]" #-c /tmp/modified_constraints.txt && \
+    #\
     # 2. Override numpy and scipy with specific versions
-    uv pip install numpy==2.1.1 scipy==1.15.3 && \
+    # uv pip install numpy==2.1.1 scipy==1.15.3 && \
     \
     # 3. Verify that the colocated_python_cpu_client is present.
     echo "--> Verifying JAX patch integrity..." && \

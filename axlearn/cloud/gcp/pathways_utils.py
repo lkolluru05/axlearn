@@ -60,7 +60,7 @@ _COLOCATED_CONTAINER_PORT = 50051
 # Pin to specific pathways image version for stable release.
 # There is no guarantee that this image will work with newer Jax releases.
 # Note: This image has been tested with both Jax 0.8.2 and Jax 0.9.0
-_PATHWAYS_IMAGE_TAG = "20260128-jax_0.9.0"
+_PATHWAYS_IMAGE_TAG = "20260826-jax_0.9.0"
 # The docker image used by pathways proxy container.
 _PATHWAYS_PROXY_IMAGE = (
     f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
@@ -129,9 +129,9 @@ PATHWAYS_DEBUG_VMODULE = (
 
 
 def get_colocated_python_image(image_id: str) -> str:
-    path, _ = image_id.rsplit(":", maxsplit=1)
+    path, tag = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
-    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
+    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{tag}"
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
