@@ -251,7 +251,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
             )
     
     if elastic_snapshotting_enabled:
-        wait_for_all_devices()
+        wait_for_all_devices(timeout_seconds=1800)
 
     elastic_manager = None
     elastic_manager_initialized = False
