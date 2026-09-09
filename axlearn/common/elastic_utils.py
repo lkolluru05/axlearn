@@ -223,9 +223,6 @@ def handle_preemption_recovery(
         )
         wait_for_slices(active_count, timeout_seconds=pause_timeout_seconds)
 
-    if elastic_manager:
-        elastic_manager.new_slice_event.set()
-
     return active_count
 
 
