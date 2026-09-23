@@ -13,6 +13,7 @@ import time
 from collections.abc import Sequence
 from typing import Any, Callable, ContextManager, Literal, NamedTuple, Optional, Union, TYPE_CHECKING
 
+from axlearn.common import elastic_utils
 import jax
 import numpy as np
 from absl import logging
@@ -805,6 +806,7 @@ class SpmdTrainer(Module):
                 snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx, trainer_state_specs=self.trainer_state_specs)
                 self.snapshot_mgr = snapshot_cfg.instantiate()
                 logging.info("[ELASTIC] Snapshot manager instantiated.")
+                elastic_utils.record_elastic_reinit_end()
             else:
                 logging.info("[ELASTIC] Snapshot manager carried over from previous run.")
             

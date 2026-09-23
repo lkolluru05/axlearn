@@ -21,6 +21,7 @@ import time
 from typing import Any, Optional, Set, Tuple
 
 from absl import logging
+from axlearn.common import measurement
 import jax
 import numpy as np
 
@@ -35,6 +36,54 @@ except (ImportError, ModuleNotFoundError):
 
 _elastic_manager: Optional[Any] = None
 RETRYABLE_KEYWORDS = ("data_loss", "unavailable", "unplaced", "slice down", "died", "resource_exhausted")
+_max_slices: int = 0
+_in_elastic_reinit: bool = False
+_active_elastic_event_type: str = "elastic_wait"
+
+
+def get_slice_counts() -> tuple[int, int]:
+    global _max_slices
+    devices = live_devices if live_devices else jax.devices()
+    active_slices = len({getattr(d, "slice_index", 0) for d in devices})
+    _max_slices = max(_max_slices, active_slices)
+    return active_slices, _max_slices
+
+
+def record_slice_state(active_slices_override: Optional[int] = None) -> None:
+    active_slices, max_slices = get_slice_counts()
+    if active_slices_override is not None:
+        active_slices = active_slices_override
+    if max_slices > 0:
+        measurement.record_event(
+            measurement.Event.RECORD_SLICE_COUNTS,
+            active_slices=active_slices,
+            max_slices=max_slices,
+        )
+
+
+def record_elastic_event_start(event_type: str) -> None:
+    global _active_elastic_event_type
+    _active_elastic_event_type = event_type
+    measurement.record_event(measurement.Event.START_ELASTIC_WAIT)
+    record_slice_state(active_slices_override=0)
+
+
+def record_elastic_wait_end_and_reinit_start() -> None:
+    global _in_elastic_reinit
+    measurement.record_event(
+        measurement.Event.END_ELASTIC_WAIT, event_type=_active_elastic_event_type
+    )
+    measurement.record_event(measurement.Event.START_ELASTIC_REINIT)
+    _in_elastic_reinit = True
+    record_slice_state()
+
+
+def record_elastic_reinit_end() -> None:
+    global _in_elastic_reinit
+    if _in_elastic_reinit:
+        measurement.record_event(measurement.Event.END_ELASTIC_REINIT)
+        record_slice_state()
+        _in_elastic_reinit = False
 
 
 def set_elastic_manager(manager_inst: Any):
@@ -200,6 +249,7 @@ def handle_preemption_recovery(
             required_slices,
             pause_timeout_seconds,
         )
+        record_elastic_wait_end_and_reinit_start()
         try:
             wait_for_slices(required_slices, timeout_seconds=pause_timeout_seconds)
             logging.info("[ELASTIC] Slices recovered to %d! Resuming training from in-memory snapshot.", required_slices)
@@ -425,7 +475,7 @@ def sync_restore_class_vars(
     fresh_trainer._watchdog_thread = None
     fresh_trainer._watchdog_stopping = None
     fresh_trainer._device_monitor = None
-    fresh_trainer._recorder = None
+    # fresh_trainer._recorder = None
 
     fresh_trainer._jax_device_state = jax_device_state
     fresh_trainer._python_vars = python_vars

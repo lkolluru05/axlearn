@@ -28,6 +28,9 @@ import jax
 from absl import flags, logging
 from ml_goodput_measurement import goodput
 from ml_goodput_measurement import monitoring as goodput_monitoring
+from ml_goodput_measurement.src import goodput_elastic
+from ml_goodput_measurement.src import monitoring_elastic
+
 
 from axlearn.cloud.common.utils import parse_kv_flags, to_bool
 from axlearn.common import measurement_base
@@ -93,11 +96,13 @@ class GoodputRecorder(measurement_base.Recorder):
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        self._recorder: Optional[goodput.GoodputRecorder] = None
-        self._monitor: Optional[goodput_monitoring.GoodputMonitor] = None
-        self._rolling_window_monitor: Optional[goodput_monitoring.GoodputMonitor] = None
+        self._recorder: Optional[goodput_elastic.ElasticGoodputRecorder] = None
+        self._monitor: Optional[monitoring_elastic.ElasticGoodputMonitor] = None
+        self._rolling_window_monitor: Optional[monitoring_elastic.ElasticGoodputMonitor] = None
         self._job_name = cfg.name
         self._logger_name = f"goodput_logger_{cfg.name}"
+        self._monitor_running = False
+        self._rolling_monitor_running = False
 
     @contextlib.contextmanager
     def record_event(self, event: measurement_base.EventType, *args, **kwargs):
@@ -106,7 +111,7 @@ class GoodputRecorder(measurement_base.Recorder):
         if self._recorder is None:
             if jax.process_index() == 0:
                 logging.info("Lazily instantiating goodput recorder.")
-            self._recorder = goodput.GoodputRecorder(
+            self._recorder = goodput_elastic.ElasticGoodputRecorder(
                 job_name=self._job_name,
                 logger_name=self._logger_name,
                 logging_enabled=(jax.process_index() == 0),
@@ -158,15 +163,19 @@ class GoodputRecorder(measurement_base.Recorder):
         if not self.config.enable_monitoring or jax.process_index() != 0:
             yield
             return
+        if self._monitor_running:
+            yield
+            return
+        self._monitor_running = True
         try:
             if self._monitor is None:
-                self._monitor = goodput_monitoring.GoodputMonitor(
+                self._monitor = monitoring_elastic.ElasticGoodputMonitor(
                     job_name=self._job_name,
                     logger_name=self._logger_name,
                     tensorboard_dir=self.config.upload_dir,
                     upload_interval=self.config.upload_interval,
                     monitoring_enabled=True,
-                    pathway_enabled=self.config.jax_backend == "proxy",
+                    # pathway_enabled=self.config.jax_backend == "proxy",
                     include_badput_breakdown=True,
                 )
 
@@ -174,6 +183,7 @@ class GoodputRecorder(measurement_base.Recorder):
             logging.info("Started Goodput upload to Tensorboard & GCM in the background!")
             yield
         finally:
+            self._monitor_running = False
             if self._monitor:
                 self._monitor.stop_goodput_uploader()
                 logging.info("Flushed final metrics and safe exited from Goodput monitoring.")
@@ -188,18 +198,22 @@ class GoodputRecorder(measurement_base.Recorder):
         ):
             yield
             return
+        if self._rolling_monitor_running:
+            yield
+            return
+        self._rolling_monitor_running = True
         try:
             if self._rolling_window_monitor is None:
                 rolling_window_tensorboard_dir = os.path.join(
                     self.config.upload_dir, f"rolling_window_{self.config.name}"
                 )
-                self._rolling_window_monitor = goodput_monitoring.GoodputMonitor(
+                self._rolling_window_monitor = monitoring_elastic.ElasticGoodputMonitor(
                     job_name=self._job_name,
                     logger_name=self._logger_name,
                     tensorboard_dir=rolling_window_tensorboard_dir,
                     upload_interval=self.config.upload_interval,
                     monitoring_enabled=True,
-                    pathway_enabled=self.config.jax_backend == "proxy",
+                    # pathway_enabled=self.config.jax_backend == "proxy",
                     include_badput_breakdown=True,
                 )
             self._rolling_window_monitor.start_rolling_window_goodput_uploader(
@@ -208,6 +222,7 @@ class GoodputRecorder(measurement_base.Recorder):
             logging.info("Started Rolling Window Goodput monitoring in the background!")
             yield
         finally:
+            self._rolling_monitor_running = False
             if self._rolling_window_monitor:
                 self._rolling_window_monitor.stop_rolling_window_goodput_uploader()
                 logging.info(
@@ -260,6 +275,17 @@ class GoodputRecorder(measurement_base.Recorder):
             self._recorder.record_custom_badput_event_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
             self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
+        elif event == measurement_base.Event.START_ELASTIC_WAIT:
+            self._recorder.record_elastic_wait_start_time(*args, **kwargs)
+        elif event == measurement_base.Event.END_ELASTIC_WAIT:
+            self._recorder.record_elastic_wait_end_time(*args, **kwargs)
+        elif event == measurement_base.Event.START_ELASTIC_REINIT:
+            self._recorder.record_elastic_reinit_start_time(*args, **kwargs)
+        elif event == measurement_base.Event.END_ELASTIC_REINIT:
+            self._recorder.record_elastic_reinit_end_time(*args, **kwargs)
+        elif event == measurement_base.Event.RECORD_SLICE_COUNTS:
+            self._recorder.record_elastic_slice_counts(*args, **kwargs)
+
         else:
             logging.log_first_n(
                 logging.WARNING,

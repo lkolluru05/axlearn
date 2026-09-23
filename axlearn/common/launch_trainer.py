@@ -29,6 +29,8 @@ from axlearn.common.elastic_utils import (
     handle_preemption_recovery,
     is_retryable_error,
     live_devices,
+    record_elastic_event_start,
+    record_slice_state,
     set_elastic_manager,
     spmd_trainer_scope,
     total_cluster_slices,
@@ -257,6 +259,33 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     elastic_manager_initialized = False
     original_slices = total_cluster_slices()
 
+    mgr_cls = None
+    try:
+        import megascale.experimental.elastic_training.Coordinate_service_manager as megascale_manager
+        mgr_cls = megascale_manager.Manager
+    except Exception as e:
+        logging.warning("Elastic: Megascale manager init failed (%s), falling back to pathwaysutils", e)
+        if manager is not None and hasattr(manager, "Manager"):
+            mgr_cls = manager.Manager
+
+    if mgr_cls is not None:
+        try:
+            set_elastic_manager(mgr_cls())
+            live_devices()
+            record_slice_state()
+        except Exception as e:
+            logging.warning("Elastic: Manager init failed (%s), continuing without it", e)
+
+
+    preserved_state = None
+    _job_completed_gracefully = False
+    monitor_ctx = (
+        measurement.global_recorder.maybe_monitor_all()
+        if measurement.global_recorder is not None
+        else contextlib.nullcontext()
+    )
+
+
     output = None
     jax_device_state = {}
     python_vars = {}
@@ -265,160 +294,171 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
     last_successful_step = -1
     consecutive_failures = 0
     logging.info("[ELASTIC] Starting elastic training loop cycle.")
-    while True:
-        try:
-            if not elastic_manager_initialized:
-                if elastic_snapshotting_enabled:
-                    logging.info("[ELASTIC] Initializing elastic manager...")
-                    elastic_manager = manager.Manager()
-                    set_elastic_manager(elastic_manager)
-                    logging.info("[ELASTIC] Elastic manager initialized.")
+    with monitor_ctx:
+        while True:
+            try:
+                if not elastic_manager_initialized:
+                    if elastic_snapshotting_enabled:
+                        logging.info("[ELASTIC] Initializing elastic manager...")
+                        if mgr_cls is not None:
+                            elastic_manager = mgr_cls()
+                            set_elastic_manager(elastic_manager)
+                            logging.info("[ELASTIC] Elastic manager initialized.")
+                        else:
+                            logging.warning("[ELASTIC] No elastic manager class available.")
+                    else:
+                        logging.info("[ELASTIC] Elastic snapshotting disabled or not supported (no slice_index).")
+                    elastic_manager_initialized = True
+
+                has_preserved_state = bool(
+                    python_vars.get("_latest_snapshot") is not None
+                    or immutable_data
+                    or jax_device_state
+                )
+
+                recovery_timer = None
+                if has_preserved_state:
+                    rec_type = python_vars.pop("_recovery_type", "scale_down")
+                    recovery_timer = ElasticRecoveryTimer(recovery_type=rec_type)
+
+                with (recovery_timer.time_subtask("2_clean_trainer_instantiation") if recovery_timer else contextlib.nullcontext()):
+                    clean_trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
+                logging.info("[ELASTIC] Instantiated clean trainer.")
+
+                # Check whether recovery should be triggered.
+                if has_preserved_state:
+                    logging.info(
+                        "[ELASTIC] [RECOVERY PHASE 1] Preserved state detected after preemption/rescaling. "
+                        "Initiating class variable and snapshot restoration onto clean trainer..."
+                    )
+                    if elastic_manager and elastic_manager.new_slice_event.is_set():
+                        logging.info("[ELASTIC] Clearing new_slice_event flag before initiating recovery.")
+                        elastic_manager.new_slice_event.clear()
+                    
+                    with (recovery_timer.time_subtask("3_snapshot_restore_and_hardware_barrier") if recovery_timer else contextlib.nullcontext()):
+                        trainer, prng_key = sync_restore_class_vars(clean_trainer, jax_device_state, python_vars, immutable_data)
+                    
+                    if "_elastic_reinit_start_time" in python_vars:
+                        trainer._elastic_reinit_start_time = python_vars["_elastic_reinit_start_time"]
+                        del python_vars["_elastic_reinit_start_time"]
+                    
+                    logging.info("[ELASTIC] [RECOVERY PHASE 1 COMPLETE] Successfully restored trainer state from class variables.")
+                    if recovery_timer:
+                        recovery_timer.log_summary()
                 else:
-                    logging.info("[ELASTIC] Elastic snapshotting disabled or not supported (no slice_index).")
-                elastic_manager_initialized = True
+                    logging.info("[ELASTIC] Starting fresh trainer initialization (no elastic recovery triggered).")
+                    trainer = clean_trainer
+                    prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
 
-            has_preserved_state = bool(
-                python_vars.get("_latest_snapshot") is not None
-                or immutable_data
-                or jax_device_state
-            )
-
-            recovery_timer = None
-            if has_preserved_state:
-                rec_type = python_vars.pop("_recovery_type", "scale_down")
-                recovery_timer = ElasticRecoveryTimer(recovery_type=rec_type)
-
-            with (recovery_timer.time_subtask("2_clean_trainer_instantiation") if recovery_timer else contextlib.nullcontext()):
-                clean_trainer: SpmdTrainer = trainer_config.instantiate(parent=None)
-            logging.info("[ELASTIC] Instantiated clean trainer.")
-
-            # Check whether recovery should be triggered.
-            if has_preserved_state:
-                logging.info(
-                    "[ELASTIC] [RECOVERY PHASE 1] Preserved state detected after preemption/rescaling. "
-                    "Initiating class variable and snapshot restoration onto clean trainer..."
-                )
-                if elastic_manager and elastic_manager.new_slice_event.is_set():
-                    logging.info("[ELASTIC] Clearing new_slice_event flag before initiating recovery.")
-                    elastic_manager.new_slice_event.clear()
-                
-                with (recovery_timer.time_subtask("3_snapshot_restore_and_hardware_barrier") if recovery_timer else contextlib.nullcontext()):
-                    trainer, prng_key = sync_restore_class_vars(clean_trainer, jax_device_state, python_vars, immutable_data)
-                
-                if "_elastic_reinit_start_time" in python_vars:
-                    trainer._elastic_reinit_start_time = python_vars["_elastic_reinit_start_time"]
-                    del python_vars["_elastic_reinit_start_time"]
-                
-                logging.info("[ELASTIC] [RECOVERY PHASE 1 COMPLETE] Successfully restored trainer state from class variables.")
-                if recovery_timer:
-                    recovery_timer.log_summary()
-            else:
-                logging.info("[ELASTIC] Starting fresh trainer initialization (no elastic recovery triggered).")
-                trainer = clean_trainer
-                prng_key = jax.random.PRNGKey(seed=FLAGS.trainer_prng_seed)
-
-            jax_device_state = {}
-            immutable_data = {}
-            clean_trainer = None
-            gc.collect()
-
-            with spmd_trainer_scope(trainer):
-                with _slice_monitor_context(elastic_manager, original_slices):
-                    logging.info("[ELASTIC] Starting trainer.run().")
-                    output = trainer.run(prng_key)
-                    logging.info("[ELASTIC] trainer.run() completed.")
-
-            from axlearn.common.utils import ScaleUpSignal
-            if isinstance(output, ScaleUpSignal):
-                logging.info("[ELASTIC] Scale-up signal received! Initiating transition to expanded mesh...")
-                
-                t_stabilize_start = time.perf_counter()
-
-                python_vars["_recovery_type"] = "scale_up"
-                python_vars, jax_device_state, immutable_data = _teardown_and_preserve_state(
-                    trainer, python_vars, jax_device_state, immutable_data
-                )
-                trainer = None
-                clean_trainer = None
-
-                elastic_manager_initialized = False
-
-                target_slices = original_slices
-                if elastic_manager:
-                    try:
-                        active_slices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
-                        target_slices = min(original_slices, len(active_slices))
-                    except Exception as active_err:
-                        logging.warning("[ELASTIC] Failed to get active slice count for scale-up: %s", active_err)
-                target_slices = max(1, target_slices)
-
-                logging.info("[ELASTIC] Waiting for %d slices to be active for scale-up...", target_slices)
-                wait_for_slices(target_slices)
-                
-
-                logging.info(
-                    "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
-                    time.perf_counter() - t_stabilize_start
-                )
-                
-                t_reinit_start = time.perf_counter()
-
-                python_vars["_elastic_reinit_start_time"] = t_reinit_start
-                
-                continue
-
-            measurement.record_event(measurement.Event.END_JOB)
-            break
-            
-        except Exception as e:
-            logging.exception("[ELASTIC] [EXC_DUMP] Intercepted exception in run_trainer loop: %s (%s)", e, type(e))
-            if "jax_device_state" not in locals():
                 jax_device_state = {}
-            if "immutable_data" not in locals():
                 immutable_data = {}
-            if "python_vars" not in locals():
-                python_vars = {}
-            if is_retryable_error(e):
-                logging.warning(
-                    "[ELASTIC] Caught retryable error: %s. Initiating in-memory state preservation and TPU cleanup...", e
-                )
-                
-                t_stabilize_start = time.perf_counter()
-
-                python_vars["_recovery_type"] = "scale_down"
-                python_vars, jax_device_state, immutable_data = _teardown_and_preserve_state(
-                    trainer, python_vars, jax_device_state, immutable_data
-                )
-                trainer = None
                 clean_trainer = None
+                gc.collect()
 
-                current_step = int(python_vars.get("_step", -1))
-                if current_step > last_successful_step:
-                    last_successful_step = current_step
-                    consecutive_failures = 1
+                with spmd_trainer_scope(trainer):
+                    with _slice_monitor_context(elastic_manager, original_slices):
+                        logging.info("[ELASTIC] Starting trainer.run().")
+                        output = trainer.run(prng_key)
+                        logging.info("[ELASTIC] trainer.run() completed.")
+
+                from axlearn.common.utils import ScaleUpSignal
+                if isinstance(output, ScaleUpSignal):
+                    record_elastic_event_start("elastic_scale_up")
+                    
+                    logging.info("[ELASTIC] Scale-up signal received! Initiating transition to expanded mesh...")
+                    
+                    t_stabilize_start = time.perf_counter()
+
+                    python_vars["_recovery_type"] = "scale_up"
+                    python_vars, jax_device_state, immutable_data = _teardown_and_preserve_state(
+                        trainer, python_vars, jax_device_state, immutable_data
+                    )
+                    trainer = None
+                    clean_trainer = None
+
+                    elastic_manager_initialized = False
+
+                    target_slices = original_slices
+                    if elastic_manager:
+                        try:
+                            active_slices = elastic.get_active_slice_indices(elastic_manager.slice_to_devices)
+                            target_slices = min(original_slices, len(active_slices))
+                        except Exception as active_err:
+                            logging.warning("[ELASTIC] Failed to get active slice count for scale-up: %s", active_err)
+                    target_slices = max(1, target_slices)
+
+                    logging.info("[ELASTIC] Waiting for %d slices to be active for scale-up...", target_slices)
+                    wait_for_slices(target_slices)
+                    
+
+                    logging.info(
+                        "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
+                        time.perf_counter() - t_stabilize_start
+                    )
+                    
+                    t_reinit_start = time.perf_counter()
+
+                    python_vars["_elastic_reinit_start_time"] = t_reinit_start
+                    
+                    continue
+                _job_completed_gracefully = True
+                measurement.record_event(measurement.Event.END_JOB)
+                break
+                
+            except Exception as e:
+                logging.exception("[ELASTIC] [EXC_DUMP] Intercepted exception in run_trainer loop: %s (%s)", e, type(e))
+                if "jax_device_state" not in locals():
+                    jax_device_state = {}
+                if "immutable_data" not in locals():
+                    immutable_data = {}
+                if "python_vars" not in locals():
+                    python_vars = {}
+                if is_retryable_error(e):
+                    record_elastic_event_start("elastic_slice_down")
+                    logging.warning(
+                        "[ELASTIC] Caught retryable error: %s. Initiating in-memory state preservation and TPU cleanup...", e
+                    )
+                    
+                    t_stabilize_start = time.perf_counter()
+
+                    python_vars["_recovery_type"] = "scale_down"
+                    python_vars, jax_device_state, immutable_data = _teardown_and_preserve_state(
+                        trainer, python_vars, jax_device_state, immutable_data
+                    )
+                    trainer = None
+                    clean_trainer = None
+
+                    current_step = int(python_vars.get("_step", -1))
+                    if current_step > last_successful_step:
+                        last_successful_step = current_step
+                        consecutive_failures = 1
+                    else:
+                        consecutive_failures += 1
+
+                    backoff_delay = min(15, 2 ** (consecutive_failures - 1))
+                    logging.info(
+                        "[ELASTIC] Memory cleanup complete. Sleeping %ds (backoff delay, consecutive failures: %d) before re-instantiating...",
+                        backoff_delay, consecutive_failures
+                    )
+                    time.sleep(backoff_delay)
+                    
+                    handle_preemption_recovery(elastic_manager, required_slices=FLAGS.num_elastic_slices)
+
+                    logging.info(
+                        "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
+                        time.perf_counter() - t_stabilize_start
+                    )
+                    
+                    t_reinit_start = time.perf_counter()
+
+                    python_vars["_elastic_reinit_start_time"] = t_reinit_start
+                    
+                    continue
                 else:
-                    consecutive_failures += 1
+                    logging.error("[ELASTIC] Caught non-retryable error: %s", e)
+                    raise e
+            finally:
+                if _job_completed_gracefully:
+                    measurement.record_event(measurement.Event.END_JOB)
 
-                backoff_delay = min(15, 2 ** (consecutive_failures - 1))
-                logging.info(
-                    "[ELASTIC] Memory cleanup complete. Sleeping %ds (backoff delay, consecutive failures: %d) before re-instantiating...",
-                    backoff_delay, consecutive_failures
-                )
-                time.sleep(backoff_delay)
-                
-                handle_preemption_recovery(elastic_manager, required_slices=FLAGS.num_elastic_slices)
-
-                logging.info(
-                    "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
-                    time.perf_counter() - t_stabilize_start
-                )
-                
-                t_reinit_start = time.perf_counter()
-
-                python_vars["_elastic_reinit_start_time"] = t_reinit_start
-                
-                continue
-            else:
-                logging.error("[ELASTIC] Caught non-retryable error: %s", e)
-                raise e
     return output
