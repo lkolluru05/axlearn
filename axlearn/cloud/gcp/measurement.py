@@ -247,7 +247,7 @@ class GoodputRecorder(measurement_base.Recorder):
         # Lazily instantiate the recorder. This avoids invoking jax before setup is complete.
         if self._recorder is None:
             cfg: GoodputRecorder.Config = self.config
-            self._recorder = goodput.GoodputRecorder(
+            self._recorder = goodput_elastic.ElasticGoodputRecorder(
                 job_name=cfg.name,
                 logger_name=f"goodput_logger_{cfg.name}",
                 logging_enabled=(jax.process_index() == 0),
@@ -276,8 +276,12 @@ class GoodputRecorder(measurement_base.Recorder):
         elif event == measurement_base.Event.END_CUSTOM_BADPUT_EVENT:
             self._recorder.record_custom_badput_event_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_ELASTIC_WAIT:
+            if not args and "event_type" not in kwargs:
+                kwargs["event_type"] = "elastic_wait"
             self._recorder.record_elastic_wait_start_time(*args, **kwargs)
         elif event == measurement_base.Event.END_ELASTIC_WAIT:
+            if not args and "event_type" not in kwargs:
+                kwargs["event_type"] = "elastic_wait"
             self._recorder.record_elastic_wait_end_time(*args, **kwargs)
         elif event == measurement_base.Event.START_ELASTIC_REINIT:
             self._recorder.record_elastic_reinit_start_time(*args, **kwargs)

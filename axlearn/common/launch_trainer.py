@@ -389,7 +389,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
 
                     logging.info("[ELASTIC] Waiting for %d slices to be active for scale-up...", target_slices)
                     wait_for_slices(target_slices)
-                    
+                    elastic_utils.record_elastic_wait_end_and_reinit_start()
 
                     logging.info(
                         "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",
@@ -443,6 +443,7 @@ def run_trainer(trainer_config: SpmdTrainer.Config) -> Any:
                     time.sleep(backoff_delay)
                     
                     handle_preemption_recovery(elastic_manager, required_slices=FLAGS.num_elastic_slices)
+                    elastic_utils.record_elastic_wait_end_and_reinit_start()
 
                     logging.info(
                         "[ELASTIC] [TIMING] TPU Slice stabilization took %.3f seconds",

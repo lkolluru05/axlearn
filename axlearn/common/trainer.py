@@ -806,7 +806,7 @@ class SpmdTrainer(Module):
                 snapshot_cfg = config_for_class(Snapshotter).set(replica_axis_index=replica_axis_idx, trainer_state_specs=self.trainer_state_specs)
                 self.snapshot_mgr = snapshot_cfg.instantiate()
                 logging.info("[ELASTIC] Snapshot manager instantiated.")
-                elastic_utils.record_elastic_reinit_end()
+                #elastic_utils.record_elastic_reinit_end()
             else:
                 logging.info("[ELASTIC] Snapshot manager carried over from previous run.")
             
@@ -815,10 +815,11 @@ class SpmdTrainer(Module):
                 logging.info("[ELASTIC] Starting loop...")
                 
                 if hasattr(self, "_elastic_reinit_start_time"):
-                    self._maybe_record_event(
-                        measurement.Event.END_CUSTOM_BADPUT_EVENT,
-                        custom_badput_event_type="elastic_reinitialization"
-                    )
+                    # self._maybe_record_event(
+                    #     measurement.Event.END_CUSTOM_BADPUT_EVENT,
+                    #     custom_badput_event_type="elastic_reinitialization"
+                    # )
+                    elastic_utils.record_elastic_reinit_end()
                     logging.info(
                         "[ELASTIC] [TIMING] Time to resume took %.3f seconds",
                         time.perf_counter() - self._elastic_reinit_start_time

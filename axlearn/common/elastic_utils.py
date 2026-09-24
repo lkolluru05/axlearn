@@ -43,28 +43,35 @@ _active_elastic_event_type: str = "elastic_wait"
 
 def get_slice_counts() -> tuple[int, int]:
     global _max_slices
-    devices = live_devices if live_devices else jax.devices()
-    active_slices = len({getattr(d, "slice_index", 0) for d in devices})
+    devices = live_devices()
+    active_slices = len({getattr(d, "slice_index", 0) for d in devices if d is not None})
     _max_slices = max(_max_slices, active_slices)
     return active_slices, _max_slices
 
 
 def record_slice_state(active_slices_override: Optional[int] = None) -> None:
+
+    
     active_slices, max_slices = get_slice_counts()
-    if active_slices_override is not None:
-        active_slices = active_slices_override
+    # if active_slices_override is not None:
+    #     active_slices = active_slices_override
+
+    #### TODO #######
+    #available_slices = len(pathwaysutils.elastic.get_active_slice_indices())
+    ###### TODO ######
     if max_slices > 0:
         measurement.record_event(
             measurement.Event.RECORD_SLICE_COUNTS,
             active_slices=active_slices,
-            max_slices=max_slices,
+            total_slices=max_slices,
+            available_slices=active_slices,
         )
 
 
 def record_elastic_event_start(event_type: str) -> None:
     global _active_elastic_event_type
     _active_elastic_event_type = event_type
-    measurement.record_event(measurement.Event.START_ELASTIC_WAIT)
+    measurement.record_event(measurement.Event.START_ELASTIC_WAIT, event_type=event_type)
     record_slice_state(active_slices_override=0)
 
 
@@ -631,5 +638,3 @@ def _slice_monitor_context(elastic_manager: Any, original_slices: int):
             stop_monitor_event.set()
             monitor_thread.join(timeout=5)
             logging.info("[ELASTIC] Slice monitor thread stopped.")
-
-
