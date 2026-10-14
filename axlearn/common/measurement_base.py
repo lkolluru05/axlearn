@@ -26,6 +26,11 @@ class Event(enum.Enum):
         END_DATA_LOADING: End of data loading.
         START_CUSTOM_BADPUT_EVENT: Start of custom badput event.
         END_CUSTOM_BADPUT_EVENT: End of custom badput event.
+        START_ELASTIC_WAIT: Start of elastic wait.
+        END_ELASTIC_WAIT: End of elastic wait.
+        START_ELASTIC_REINIT: Start of elastic reinit (other elastic start event during elastic wait).
+        END_ELASTIC_REINIT: End of elastic reinit (other elastic end event during elastic wait).
+        RECORD_SLICE_COUNTS: Slice count during elastic event.
     """
 
     START_JOB = "START_JOB"
@@ -39,6 +44,11 @@ class Event(enum.Enum):
     END_DATA_LOADING = "END_DATA_LOADING"
     START_CUSTOM_BADPUT_EVENT = "START_CUSTOM_BADPUT_EVENT"
     END_CUSTOM_BADPUT_EVENT = "END_CUSTOM_BADPUT_EVENT"
+    START_ELASTIC_WAIT = "START_ELASTIC_WAIT"
+    END_ELASTIC_WAIT = "END_ELASTIC_WAIT"
+    START_ELASTIC_REINIT = "START_ELASTIC_REINIT"
+    END_ELASTIC_REINIT = "END_ELASTIC_REINIT"
+    RECORD_SLICE_COUNTS = "RECORD_SLICE_COUNTS"
 
 
 class EventType(enum.Enum):
