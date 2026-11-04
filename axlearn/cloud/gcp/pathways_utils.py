@@ -64,12 +64,12 @@ _PATHWAYS_IMAGE_TAG = "20260128-jax_0.9.0"
 # The docker image used by pathways proxy container.
 _PATHWAYS_PROXY_IMAGE = (
     #f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
-    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/proxy_server:serde-min-patch"
+    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/proxy_server:latest"
 )
 # The docker image used by pathways resource manager container and worker container.
 _PATHWAYS_SERVER_IMAGE = (
     #f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
-    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/server:serde-min-patch"
+    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/server:latest"
 )
 # The colocated python sidecar is independent of the axlearn codebase.
 # No need to rebuild for every job launch.
@@ -128,7 +128,7 @@ def get_colocated_python_image(image_id: str) -> str:
     path, _ = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
     #return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
-    return "us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated:pygraincolocated-test"
+    return "us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated2:pygraincolocated-test"
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
