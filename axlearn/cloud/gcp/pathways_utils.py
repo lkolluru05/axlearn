@@ -63,11 +63,13 @@ _COLOCATED_CONTAINER_PORT = 50051
 _PATHWAYS_IMAGE_TAG = "20260128-jax_0.9.0"
 # The docker image used by pathways proxy container.
 _PATHWAYS_PROXY_IMAGE = (
-    f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
+    #f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
+    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/proxy_server:serde-min-patch"
 )
 # The docker image used by pathways resource manager container and worker container.
 _PATHWAYS_SERVER_IMAGE = (
-    f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
+    #f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
+    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/server:serde-min-patch"
 )
 # The colocated python sidecar is independent of the axlearn codebase.
 # No need to rebuild for every job launch.
@@ -125,7 +127,8 @@ OTEL_COLLECTOR_CONFIG_MOUNT_PATH = "/conf"
 def get_colocated_python_image(image_id: str) -> str:
     path, _ = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
-    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
+    #return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
+    return "us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated:pygraincolocated-test"
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
@@ -283,13 +286,25 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
                     "value": _PATHWAYS_SHM_DIR,
                 },
                 {
+                    "name": "JAX_PLATFORMS",
+                    "value": "cpu",
+                },
+                {
                     "name": "GRPC_SERVER_ADDRESS",
                     "value": f"0.0.0.0:{_COLOCATED_CONTAINER_PORT}",
                 },
             ],
             imagePullPolicy="Always",
             ports=[dict(containerPort=_COLOCATED_CONTAINER_PORT)],
-            volumeMounts=[{"mountPath": _PATHWAYS_SHM_DIR, "name": _PATHWAYS_SHM_VOLUME_NAME}],
+            volumeMounts=[dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR),
+                          dict(name="sidecar-uds", mountPath="/sock"),
+                        ],
+            args=[
+                "--unix_domain_socket_path=/sock/sidecar.sock",
+                "--logtostderr",
+                "--stderrthreshold=0",
+                "--v=2",
+            ]
         )
 
     @property
@@ -366,6 +381,9 @@ def _build_base_pathways_worker_container(
             [
                 f"--tpu_premapped_buffer_size={premapped_buffer_size_gb * (1 << 30)}",
                 f"--cloud_pathways_sidecar_shm_directory={_PATHWAYS_SHM_DIR}",
+                "--logtostderr",
+                "--stderrthreshold=0",
+                "--v=1",
             ]
         )
     worker_container["args"] = args
@@ -377,7 +395,9 @@ def _build_base_pathways_worker_container(
     worker_container["ports"] = ports
     if colocated_python_plugin.is_colocated_python_enabled:
         worker_container["volumeMounts"] = [
-            dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR)
+            dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR),
+            #{"mountPath": "sidecar-uds", "name": "/sock"},
+            dict(name="sidecar-uds", mountPath="/sock"),
         ]
 
     # Command will be executed by the head node, and it will compile the model and
@@ -526,16 +546,18 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
     def _build_pathways_head_container(self) -> dict:
         """Build the container for the 'pathways-head' role."""
+        pathways_head_address = self._get_pathways_head_address()
         # pylint: disable-next=protected-access
         container = self._inner._build_container()
 
         head_container = copy.deepcopy(container)
 
         env_list = head_container.get("env", [])
+        self._update_env_list(env_list, "HOST_ADDRESS", pathways_head_address)
         self._update_env_list(
             env_list,
             "JAX_BACKEND_TARGET",
-            f"grpc://localhost:{_PATHWAYS_PROXY_PORT}",
+            f"grpc://{pathways_head_address}:{_PATHWAYS_PROXY_PORT}",
         )
         self._update_env_list(env_list, "XCLOUD_ENVIRONMENT", "GCP")
         self._update_env_list(env_list, "JAX_PLATFORMS", "proxy")
@@ -555,14 +577,6 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             env_list,
             "IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY",
             _PATHWAYS_SHM_DIR,
-        )
-        env_list.append(
-            {
-                "name": "HOST_ADDRESS",
-                "valueFrom": {
-                    "fieldRef": {"fieldPath": "metadata.labels['jobset.sigs.k8s.io/coordinator']"}
-                },
-            }
         )
 
         head_container["env"] = env_list
@@ -593,6 +607,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         """
 
         cfg: TPUReplicatedJob.Config = self._inner.config
+        pathways_head_address = self._get_pathways_head_address()
 
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         gcs_scratch_location = _pathways_staging_dir(
@@ -606,12 +621,13 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pathways_instance_count = cfg.accelerator.num_replicas if self._is_single_head else 1
 
         cmd_args = [
-            f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            f"--resource_manager_address={pathways_head_address}:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
         ]
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
-        cmd_args.extend(xla_flags_from_options(self._xla_options).split())
+            cmd_args.append("--cloud_pathways_external_sidecar_unix_domain_socket_path=/sock/sidecar.sock")
+        #cmd_args.extend(xla_flags_from_options(self._xla_options).split())
 
         instance_type = f"{pathways_tpu_version}:{system.topology}"
         if support_twisted_topology(self._tpu_type):
@@ -633,6 +649,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                         "name": "IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY",
                         "value": _PATHWAYS_SHM_DIR,
                     },
+                    {"name": "PATHWAYS_HEAD", "value": pathways_head_address},
                 ],
                 ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
                 volumeMounts=[
@@ -651,6 +668,10 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                         "name": "TPU_SKIP_MDS_QUERY",
                         "value": "true",
                     },
+                    {
+                        "name": "HOST_ADDRESS",
+                        "value": pathways_head_address,
+                    },
                 ],
                 args=[
                     f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
@@ -658,6 +679,9 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                     f"--instance_count={pathways_instance_count}",
                     f"--instance_type={instance_type}",
                     f"--gcs_scratch_location={gcs_scratch_location}",
+                    "--logtostderr",
+                    "--stderrthreshold=0",
+                    "--v=1",
                 ],
                 volumeMounts=[dict(name="shared-output", mountPath="/output")],
             ),
@@ -684,6 +708,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             # gcsfuse mounts shared-memory. To avoid double mounting, we only mount
             # shared-memory explicitly when gcsfuse_mount is not enabled.
             volumes.append(dict(name=_PATHWAYS_SHM_VOLUME_NAME, emptyDir=dict(medium="Memory")))
+            #volumes.append(dict(name="sidecar-uds", emptyDir=dict(medium="Memory")))
 
         node_selector = {
             _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
@@ -845,7 +870,13 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 "name": _PATHWAYS_SHM_VOLUME_NAME,
                 "emptyDir": {"medium": "Memory"},
             }
+            sidecar_uds = {
+                "name": "sidecar-uds",
+                "emptyDir": {"medium": "Memory"},
+            }
             pod_spec["volumes"].append(shared_memory_volume)
+            pod_spec["volumes"].append(sidecar_uds)
+
         worker_pod["spec"] = pod_spec
 
         # Service account for nodes.
