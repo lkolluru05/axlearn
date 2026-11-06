@@ -63,13 +63,11 @@ _COLOCATED_CONTAINER_PORT = 50051
 _PATHWAYS_IMAGE_TAG = "20260128-jax_0.9.0"
 # The docker image used by pathways proxy container.
 _PATHWAYS_PROXY_IMAGE = (
-    #f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
-    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/proxy_server:latest"
+    f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
 )
 # The docker image used by pathways resource manager container and worker container.
 _PATHWAYS_SERVER_IMAGE = (
-    #f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
-    "us-docker.pkg.dev/cloud-tpu-v2-images-dev/pathways/gke/ksadi/server:latest"
+    f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/server:{_PATHWAYS_IMAGE_TAG}"
 )
 # The colocated python sidecar is independent of the axlearn codebase.
 # No need to rebuild for every job launch.
@@ -123,12 +121,17 @@ OTEL_COLLECTOR_SIDECAR_NAME = "otel-sidecar"
 OTEL_COLLECTOR_CONFIG_NAME = "otel-sidecar-config"
 OTEL_COLLECTOR_CONFIG_MOUNT_PATH = "/conf"
 
+PATHWAYS_DEBUG_VMODULE = (
+    "--vmodule=grpc_service_impl=3,ifrt_backend=3,rpc_transport=2,"
+    "resource_manager=2,device_set_manager=2,compilation_client=2,"
+    "grpc_host_buffer=3,rpc_helper=3,host_buffer=3"
+)
+
 
 def get_colocated_python_image(image_id: str) -> str:
     path, _ = image_id.rsplit(":", maxsplit=1)
     repo, _ = path.rsplit("/", maxsplit=1)
-    #return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
-    return "us-docker.pkg.dev/cloud-tpu-multipod-dev/axlearn/pygraincolocated2:pygraincolocated-test"
+    return f"{repo}/{_COLOCATED_PYTHON_SIDECAR_NAME}:{_COLOCATED_SIDECAR_IMAGE_TAG}"
 
 
 def parse_xla_flag_value(value: str) -> Union[int, bool, str]:
@@ -286,25 +289,13 @@ class PathwaysColocatedPythonPlugin(FlagConfigurable):
                     "value": _PATHWAYS_SHM_DIR,
                 },
                 {
-                    "name": "JAX_PLATFORMS",
-                    "value": "cpu",
-                },
-                {
                     "name": "GRPC_SERVER_ADDRESS",
                     "value": f"0.0.0.0:{_COLOCATED_CONTAINER_PORT}",
                 },
             ],
             imagePullPolicy="Always",
             ports=[dict(containerPort=_COLOCATED_CONTAINER_PORT)],
-            volumeMounts=[dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR),
-                          dict(name="sidecar-uds", mountPath="/sock"),
-                        ],
-            args=[
-                "--unix_domain_socket_path=/sock/sidecar.sock",
-                "--logtostderr",
-                "--stderrthreshold=0",
-                "--v=2",
-            ]
+            volumeMounts=[{"mountPath": _PATHWAYS_SHM_DIR, "name": _PATHWAYS_SHM_VOLUME_NAME}],
         )
 
     @property
@@ -334,6 +325,7 @@ def _build_base_pathways_worker_container(
     tpu_type: str,
     colocated_python_plugin: PathwaysColocatedPythonPlugin,
     resource_manager_address: str,
+    pathways_debug: bool = False,
 ) -> dict:
     """Builds a base pathways worker container.
 
@@ -366,6 +358,8 @@ def _build_base_pathways_worker_container(
         # Recycling host memory gives a slight increase in performance.
         "--tpu_pinned_host_allocation_recycle=true",
     ]
+    if pathways_debug:
+        args.append(PATHWAYS_DEBUG_VMODULE)
     if not colocated_python_plugin.is_colocated_python_enabled:
         args.append(
             # The flag below is needed for better H2D performance.
@@ -381,9 +375,6 @@ def _build_base_pathways_worker_container(
             [
                 f"--tpu_premapped_buffer_size={premapped_buffer_size_gb * (1 << 30)}",
                 f"--cloud_pathways_sidecar_shm_directory={_PATHWAYS_SHM_DIR}",
-                "--logtostderr",
-                "--stderrthreshold=0",
-                "--v=1",
             ]
         )
     worker_container["args"] = args
@@ -395,9 +386,7 @@ def _build_base_pathways_worker_container(
     worker_container["ports"] = ports
     if colocated_python_plugin.is_colocated_python_enabled:
         worker_container["volumeMounts"] = [
-            dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR),
-            #{"mountPath": "sidecar-uds", "name": "/sock"},
-            dict(name="sidecar-uds", mountPath="/sock"),
+            dict(name=_PATHWAYS_SHM_VOLUME_NAME, mountPath=_PATHWAYS_SHM_DIR)
         ]
 
     # Command will be executed by the head node, and it will compile the model and
@@ -433,6 +422,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pathways_xla_flags: list[str] = []
         pathways_head_cpu: Optional[str] = None
         pathways_head_mem: Optional[str] = None
+        pathways_debug: Optional[bool] = None
 
         colocated_python: Required[PathwaysColocatedPythonPlugin.Config] = REQUIRED
 
@@ -463,12 +453,19 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             "Memory request for pathways-head container in GiB. Default is 16GiB",
             **common_kwargs,
         )
+        flags.DEFINE_boolean(
+            "pathways_debug",
+            None,
+            "Enable debug logging for Pathways.",
+            **common_kwargs,
+        )
 
     @classmethod
     def set_defaults(cls, fv):
         super().set_defaults(fv)
         fv.set_default("pathways_head_cpu", fv.pathways_head_cpu or "1")
         fv.set_default("pathways_head_mem", fv.pathways_head_mem or "16")
+        fv.set_default("pathways_debug", fv.pathways_debug or False)
 
     @classmethod
     def default_config(cls):
@@ -546,18 +543,16 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
 
     def _build_pathways_head_container(self) -> dict:
         """Build the container for the 'pathways-head' role."""
-        pathways_head_address = self._get_pathways_head_address()
         # pylint: disable-next=protected-access
         container = self._inner._build_container()
 
         head_container = copy.deepcopy(container)
 
         env_list = head_container.get("env", [])
-        self._update_env_list(env_list, "HOST_ADDRESS", pathways_head_address)
         self._update_env_list(
             env_list,
             "JAX_BACKEND_TARGET",
-            f"grpc://{pathways_head_address}:{_PATHWAYS_PROXY_PORT}",
+            f"grpc://localhost:{_PATHWAYS_PROXY_PORT}",
         )
         self._update_env_list(env_list, "XCLOUD_ENVIRONMENT", "GCP")
         self._update_env_list(env_list, "JAX_PLATFORMS", "proxy")
@@ -577,6 +572,14 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             env_list,
             "IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY",
             _PATHWAYS_SHM_DIR,
+        )
+        env_list.append(
+            {
+                "name": "HOST_ADDRESS",
+                "valueFrom": {
+                    "fieldRef": {"fieldPath": "metadata.labels['jobset.sigs.k8s.io/coordinator']"}
+                },
+            }
         )
 
         head_container["env"] = env_list
@@ -607,7 +610,6 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         """
 
         cfg: TPUReplicatedJob.Config = self._inner.config
-        pathways_head_address = self._get_pathways_head_address()
 
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         gcs_scratch_location = _pathways_staging_dir(
@@ -621,17 +623,28 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
         pathways_instance_count = cfg.accelerator.num_replicas if self._is_single_head else 1
 
         cmd_args = [
-            f"--resource_manager_address={pathways_head_address}:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
         ]
+        if self.config.pathways_debug:
+            cmd_args.append(PATHWAYS_DEBUG_VMODULE)
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
-            cmd_args.append("--cloud_pathways_external_sidecar_unix_domain_socket_path=/sock/sidecar.sock")
-        #cmd_args.extend(xla_flags_from_options(self._xla_options).split())
+        cmd_args.extend(xla_flags_from_options(self._xla_options).split())
 
         instance_type = f"{pathways_tpu_version}:{system.topology}"
         if support_twisted_topology(self._tpu_type):
             instance_type = f"{instance_type}_untwisted"
+        rm_args = [
+            f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            "--node_type=resource_manager",
+            f"--instance_count={pathways_instance_count}",
+            f"--instance_type={instance_type}",
+            f"--gcs_scratch_location={gcs_scratch_location}",
+        ]
+        if self.config.pathways_debug:
+            rm_args.append(PATHWAYS_DEBUG_VMODULE)
+
         return [
             dict(
                 name=_PATHWAYS_PROXY_CONTAINER_NAME,
@@ -649,7 +662,6 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                         "name": "IFRT_PROXY_LARGE_TRANSFER_OPTIMIZATION_DIRECTORY",
                         "value": _PATHWAYS_SHM_DIR,
                     },
-                    {"name": "PATHWAYS_HEAD", "value": pathways_head_address},
                 ],
                 ports=[dict(containerPort=_PATHWAYS_PROXY_PORT)],
                 volumeMounts=[
@@ -668,21 +680,8 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                         "name": "TPU_SKIP_MDS_QUERY",
                         "value": "true",
                     },
-                    {
-                        "name": "HOST_ADDRESS",
-                        "value": pathways_head_address,
-                    },
                 ],
-                args=[
-                    f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
-                    "--node_type=resource_manager",
-                    f"--instance_count={pathways_instance_count}",
-                    f"--instance_type={instance_type}",
-                    f"--gcs_scratch_location={gcs_scratch_location}",
-                    "--logtostderr",
-                    "--stderrthreshold=0",
-                    "--v=1",
-                ],
+                args=rm_args,
                 volumeMounts=[dict(name="shared-output", mountPath="/output")],
             ),
         ]
@@ -708,7 +707,6 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             # gcsfuse mounts shared-memory. To avoid double mounting, we only mount
             # shared-memory explicitly when gcsfuse_mount is not enabled.
             volumes.append(dict(name=_PATHWAYS_SHM_VOLUME_NAME, emptyDir=dict(medium="Memory")))
-            #volumes.append(dict(name="sidecar-uds", emptyDir=dict(medium="Memory")))
 
         node_selector = {
             _PATHWAYS_HEAD_NODE_POOL_SELECTOR_KEY: _PATHWAYS_HEAD_NODE_POOL_SELECTOR_VALUE,
@@ -793,6 +791,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             tpu_type=self._tpu_type,
             colocated_python_plugin=self._colocated_python,
             resource_manager_address=pathways_head_address,
+            pathways_debug=self.config.pathways_debug,
         )
 
         env_list = worker_container.get("env", [])
@@ -870,13 +869,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                 "name": _PATHWAYS_SHM_VOLUME_NAME,
                 "emptyDir": {"medium": "Memory"},
             }
-            sidecar_uds = {
-                "name": "sidecar-uds",
-                "emptyDir": {"medium": "Memory"},
-            }
             pod_spec["volumes"].append(shared_memory_volume)
-            pod_spec["volumes"].append(sidecar_uds)
-
         worker_pod["spec"] = pod_spec
 
         # Service account for nodes.
@@ -1089,6 +1082,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         pathways_xla_flags: list[str] = []
         pathways_head_cpu: Optional[str] = None
         pathways_head_mem: Optional[str] = None
+        pathways_debug: Optional[bool] = None
 
         target_port: Optional[int] = None
         enable_service: bool = None
@@ -1184,12 +1178,19 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             "Port for health check endpoint used by startup and readiness probes.",
             **common_kwargs,
         )
+        flags.DEFINE_boolean(
+            "pathways_debug",
+            None,
+            "Enable debug logging for Pathways.",
+            **common_kwargs,
+        )
 
     @classmethod
     def set_defaults(cls, fv):
         super().set_defaults(fv)
         fv.set_default("pathways_head_cpu", fv.pathways_head_cpu or "1")
         fv.set_default("pathways_head_mem", fv.pathways_head_mem or "16")
+        fv.set_default("pathways_debug", fv.pathways_debug or False)
         fv.set_default("target_port", fv.target_port or 9000)
         fv.set_default("enable_service", fv.enable_service or False)
         fv.set_default("gke_gateway_route", fv.gke_gateway_route or False)
@@ -1263,6 +1264,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             tpu_type=self._tpu_type,
             colocated_python_plugin=self._colocated_python,
             resource_manager_address="$(LWS_LEADER_ADDRESS)",
+            pathways_debug=self.config.pathways_debug,
         )
 
     def build_worker_pod(self) -> dict:
@@ -1308,6 +1310,8 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
         ]
+        if self.config.pathways_debug:
+            cmd_args.append(PATHWAYS_DEBUG_VMODULE)
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
 
@@ -1329,6 +1333,16 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
         system = USER_FACING_NAME_TO_SYSTEM_CHARACTERISTICS[self._tpu_type]
         pathways_tpu_version = get_pathways_tpu_version(system.gce_machine_type)
 
+        rm_args = [
+            f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
+            "--node_type=resource_manager",
+            "--instance_count=1",
+            f"--instance_type={pathways_tpu_version}:{system.topology}",
+            f"--gcs_scratch_location={gcs_scratch_location}",
+        ]
+        if self.config.pathways_debug:
+            rm_args.append(PATHWAYS_DEBUG_VMODULE)
+
         return dict(
             name=_PATHWAYS_RESOURCE_MANAGER_CONTAINER_NAME,
             image=self._colocated_python.pathways_server_image,
@@ -1342,13 +1356,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
                     "value": "$(LWS_LEADER_ADDRESS)",
                 },
             ],
-            args=[
-                f"--server_port={_PATHWAYS_RESOURCE_MANAGER_PORT}",
-                "--node_type=resource_manager",
-                "--instance_count=1",
-                f"--instance_type={pathways_tpu_version}:{system.topology}",
-                f"--gcs_scratch_location={gcs_scratch_location}",
-            ],
+            args=rm_args,
             ports=[dict(containerPort=_PATHWAYS_RESOURCE_MANAGER_PORT)],
         )
 
