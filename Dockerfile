@@ -92,8 +92,10 @@ COPY . .
 # Install the additional user-provided dependencies, strictly enforcing the rules
 # from the base image's constraints file.
 RUN \
+    # Ensure uv is available even on custom dev sidecar images
+    pip install -qq uv && \
     # 1. Install user-provided dependencies with modified constraints
-    grep -v "^numpy" /opt/venv/server_constraints.txt | grep -v "^scipy" > /tmp/modified_constraints.txt && \
+    grep -Evi "^[[:space:]]*(numpy|scipy)" /opt/venv/server_constraints.txt > /tmp/modified_constraints.txt && \
     echo "--> Installing user-provided dependencies..." && \
     uv pip install ".[core,gcp]" -c /tmp/modified_constraints.txt && \
     \
@@ -106,7 +108,7 @@ RUN \
     echo "--> JAX patch verification successful." && \
     \
     # 4. Clean the cache to keep the image slim.
-    uv cache clean
+    uv cache clean && pip cache purge
 
 ################################################################################
 # Final target spec.                                                           #

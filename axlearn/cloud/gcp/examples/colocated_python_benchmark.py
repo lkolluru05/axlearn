@@ -56,7 +56,7 @@ def maybe_profile(enabled: bool, profile_dir: Optional[str]):
             jax.profiler.stop_trace()
 
 
-def create_mesh(mesh_shape=(1, 1, 1, 1, 1, 16, -1)):
+def create_mesh(mesh_shape=(1, 1, 1, 1, 1, 32, -1)):
     """Create a JAX mesh for distributed computation."""
     inferred_mesh_shape = infer_mesh_shape(mesh_shape)
     print(f"Using mesh shape {inferred_mesh_shape} for {len(jax.devices())} devices")
@@ -286,6 +286,7 @@ def main():
     num_iterations = args.num_iters
     print(f"--- Running {args.method} benchmark ({num_iterations} iterations) ---")
     loaded_values = None
+    time.sleep(300)
     try:
         with create_mesh():
             # Create checkpoint specs (needs mesh)
@@ -297,10 +298,12 @@ def main():
                 os.environ["COLOCATED_PYTHON_DESERIALIZE"] = "1"
 
             loaded_values = None
+            time.sleep(300)
             with maybe_profile(args.profile, profile_dir):
                 for i in range(num_iterations):
                     print(f"\n--- Iteration {i + 1}/{num_iterations} ---")
                     start_time = time.perf_counter()
+                    
                     loaded_values = load_model(
                         tensorstore_specs=tensorstore_specs,
                         shardings=shardings,
@@ -311,7 +314,7 @@ def main():
                     print(f"✅ Successfully loaded model from {args.ckpt_path}")
                     print(f"Total time took {elapsed:.2f} seconds")
                     print(f"   Total parameters: {sum(x.size for x in loaded_values):,}")
-
+                    time.sleep(300)
                     # Drop reference to TPU arrays and sleep for memory observation.
                     if i < num_iterations - 1:
                         del loaded_values
