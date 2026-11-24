@@ -23,8 +23,8 @@ core = [
     "absl-py==2.3.1",
     "chex==0.1.91",
     "etils[epy]==1.13.0",  # pin to ensure importlib-resources is installed (needed by tensorflow-datasets)
-    "jax==0.8.3",
-    "jaxlib==0.8.3",
+    "jax==0.11.1",
+    "jaxlib==0.11.1",
     "ml-dtypes==0.5.3",
     "msgpack==1.1.0",  # for checkpointing.
     "nltk==3.9.2",  # for text preprocessing
@@ -99,7 +99,7 @@ gcp = [
 # Note: Specify -f https://storage.googleapis.com/jax-releases/libtpu_releases.html during install.
 tpu = [
     "axlearn[gcp]",
-    "jax[tpu]==0.8.3",  # must be >=0.4.19 for compat with v5p.
+    "jax[tpu]==0.11.1",  # must be >=0.4.19 for compat with v5p.
     "pathwaysutils==0.1.2",  # For JAX+Pathways single-controller accelerator coordinator.
 ]
 # Vertex AI tensorboard. TODO(markblee): Merge with `gcp`.

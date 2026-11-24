@@ -2,7 +2,7 @@
 
 ARG TARGET=base
 ARG BASE_IMAGE=ubuntu:24.04
-ARG BASE_IMAGE_COLOCATED=us-docker.pkg.dev/cloud-tpu-v2-images/pathways-colocated-python/sidecar:2026_02_09-python_3.12-jax_0.8.3
+ARG BASE_IMAGE_COLOCATED=us-docker.pkg.dev/cloud-tpu-v2-images/cloud-pathways/colocated_python_sidecar:20261110-jax_0.11.1
 
 FROM ${BASE_IMAGE} AS base
 
@@ -92,23 +92,17 @@ COPY . .
 # Install the additional user-provided dependencies, strictly enforcing the rules
 # from the base image's constraints file.
 RUN \
-    # Ensure uv is available even on custom dev sidecar images
-    pip install -qq uv && \
     # 1. Install user-provided dependencies with modified constraints
-    grep -Evi "^[[:space:]]*(numpy|scipy)" /opt/venv/server_constraints.txt > /tmp/modified_constraints.txt && \
+    grep -v "^numpy" /opt/venv/server_constraints.txt | grep -v "^scipy" > /tmp/modified_constraints.txt && \
     echo "--> Installing user-provided dependencies..." && \
-    uv pip install ".[core,gcp]" -c /tmp/modified_constraints.txt && \
-    \
-    # 2. Override numpy and scipy with specific versions
-    uv pip install numpy==2.1.1 scipy==1.15.3 && \
-    \
-    # 3. Verify that the colocated_python_cpu_client is present.
+    uv pip install ".[core,gcp]" #-c /tmp/modified_constraints.txt && \
+    # 2. Verify that the colocated_python_cpu_client is present.
     echo "--> Verifying JAX patch integrity..." && \
     python -c "from jax._src.lib import _jax; _jax.colocated_python_cpu_client" && \
     echo "--> JAX patch verification successful." && \
     \
-    # 4. Clean the cache to keep the image slim.
-    uv cache clean && pip cache purge
+    # 3. Clean the cache to keep the image slim.
+    uv cache clean
 
 ################################################################################
 # Final target spec.                                                           #
